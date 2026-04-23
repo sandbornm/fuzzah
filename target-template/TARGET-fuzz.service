@@ -1,0 +1,24 @@
+[Unit]
+# Rename this file to <target>-fuzz.service after copying (e.g. mytool-fuzz.service).
+# Update the Description and ExecStart/ExecStop paths to match the target name.
+Description=<TARGET> fuzz rig (AFL++) — primary + asan + explore + triage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# start-fuzz.sh launches tmux windows and exits; fuzzers keep running in tmux.
+RemainAfterExit=true
+
+# harden.sh is idempotent. If you want this unit to also apply the egress
+# block, append `--block-egress` to the line below.
+ExecStartPre=/bin/bash -c '%h/fuzzing/targets/<TARGET>/scripts/harden.sh'
+
+ExecStart=/bin/bash %h/fuzzing/targets/<TARGET>/scripts/start-fuzz.sh
+ExecStop=/bin/bash  %h/fuzzing/targets/<TARGET>/scripts/stop-fuzz.sh
+
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=default.target

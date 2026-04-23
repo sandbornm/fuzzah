@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local overrides
+.claude/settings.local.json
+
+# Per-target scratch dirs created when you copy the template for an edit
+*-setup/

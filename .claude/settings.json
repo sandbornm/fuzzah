@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(orb -m fuzzer:*)",
+      "Bash(orb run:*)",
+      "Bash(orb ls:*)",
+      "Bash(orb status:*)",
+      "Bash(orb list:*)"
+    ]
+  }
+}

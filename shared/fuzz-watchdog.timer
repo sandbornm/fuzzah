@@ -1,0 +1,14 @@
+[Unit]
+Description=Fire fuzz-watchdog every 5 minutes
+After=default.target
+
+[Timer]
+# Tick 90 s after login, then every 5 min. AccuracySec loosens the trigger window
+# so the kernel can batch us with other wakeups — minimizes context-switch cost.
+OnBootSec=90s
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

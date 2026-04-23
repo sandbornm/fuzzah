@@ -1,0 +1,11 @@
+[Unit]
+Description=Fuzz worker watchdog — re-fires per-target start-fuzz.sh for dead roles
+# Don't start if no targets exist yet.
+ConditionPathExistsGlob=%h/fuzzing/targets/*/scripts/start-fuzz.sh
+
+[Service]
+Type=oneshot
+# Low prio so the tick never steals cycles from fuzz workers.
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/bin/bash %h/fuzzig-shared/fuzz-watchdog.sh
