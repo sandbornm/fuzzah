@@ -9,7 +9,7 @@ orb, Linux with orb, or directly inside the fuzzing VM/host) and routes
 commands accordingly.
 
 ```bash
-bash "$(git rev-parse --show-toplevel 2>/dev/null || echo .)/shared/rig-check.sh"
+bash shared/rig-check.sh
 ```
 
 After the output prints, summarize anything flagged with `[!]`:

@@ -1,7 +1,7 @@
 ---
 description: Review a single crash by hash — loads meta.json, trace.txt, and invokes the fuzz-crash-review skill to classify and recommend action. Usage: /fuzz-review <hash> <target>
 argument-hint: "<hash> <target>"
-allowed-tools: Bash(orb -m fuzzer:*)
+allowed-tools: Bash(orb -m fuzzer:*), Bash(bash:*)
 ---
 
 Deep-dive a specific crash.
@@ -15,8 +15,8 @@ Parse `$ARGUMENTS` as `<hash> <target>`.
      echo "usage: /fuzz-review <hash> <target>" >&2
      exit 1
    fi
-   orb -m fuzzer cat "$HOME/fuzzing/targets/${target}/crashes-triaged/${hash}/meta.json"
-   orb -m fuzzer head -120 "$HOME/fuzzing/targets/${target}/crashes-triaged/${hash}/trace.txt"
+   bash shared/run-on-fuzz-host.sh "cat \"\$HOME/fuzzing/targets/${target}/crashes-triaged/${hash}/meta.json\""
+   bash shared/run-on-fuzz-host.sh "head -120 \"\$HOME/fuzzing/targets/${target}/crashes-triaged/${hash}/trace.txt\""
    ```
 
 2. Apply the `fuzz-crash-review` skill's per-crash workflow (classify,

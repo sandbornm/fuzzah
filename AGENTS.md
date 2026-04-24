@@ -94,17 +94,25 @@ bash shared/check-in.sh
 bash shared/rig-check.sh
 
 # Status of one target's rig
-orb -m fuzzer bash ~/fuzzing/targets/<target>/scripts/status.sh
+bash shared/run-on-fuzz-host.sh 'bash "$HOME/fuzzing/targets/<target>/scripts/status.sh"'
 
 # Triaged crash index for a target
-orb -m fuzzer cat ~/fuzzing/targets/<target>/crashes-triaged/INDEX.md
+bash shared/run-on-fuzz-host.sh 'cat "$HOME/fuzzing/targets/<target>/crashes-triaged/INDEX.md"'
 
 # Mark a crash (advance the workflow state)
-orb -m fuzzer bash -c \
-  'echo reviewed > ~/fuzzing/targets/<target>/crashes-triaged/<hash>/.status'
+bash shared/run-on-fuzz-host.sh \
+  'echo reviewed > "$HOME/fuzzing/targets/<target>/crashes-triaged/<hash>/.status"'
+
+# Inspect a target setup before bootstrap
+bash shared/inspect-target.sh <target>
 ```
 
-(Drop `orb -m fuzzer` if you're running directly on the fuzzing host.)
+`shared/run-on-fuzz-host.sh` auto-detects direct Linux execution vs Orb and
+ensures `~` / `$HOME` expand on the fuzz host.
+
+If OrbStack is unhealthy on macOS, use `bash shared/orb-debug.sh`. Do not
+assume `orbctl status` is authoritative by itself; a wedged helper can report
+`Stopped` even when the backend has partially started.
 
 ### Crash workflow state
 
@@ -136,6 +144,12 @@ buckets crashes by this. Default when absent is `new`.
 Invoke `$fuzz-add-target` — it walks the full pipeline (seeds → 3 builds →
 cmin → triage → systemd). Reuses `target-template/` as the starting point.
 Works for cmake, autoconf, meson, and custom build systems.
+
+Helper scripts under `shared/` simplify the manual path:
+
+- `scaffold-target.sh <target>` — create `<control-root>/<target>-setup/`
+- `sync-target.sh <target>` — push that setup into `$HOME/fuzzing/targets/<target>/`
+- `bootstrap-target.sh <target>` — sync + build + cmin + systemd start
 
 ## Cross-tool contract
 

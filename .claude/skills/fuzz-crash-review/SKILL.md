@@ -15,9 +15,10 @@ fuzzer host/VM.
    ambiguous, ask the operator. (Target = the directory name under
    `~/fuzzing/targets/`.)
 
-2. **Read roster** — run (prefix with `orb -m fuzzer` if on a Mac host):
+2. **Read roster** — run through the shared wrapper so `~` / `$HOME` expand on
+   the fuzz host:
    ```
-   cat ~/fuzzing/targets/<target>/crashes-triaged/INDEX.md
+   bash shared/run-on-fuzz-host.sh 'cat "$HOME/fuzzing/targets/<target>/crashes-triaged/INDEX.md"'
    ```
    Note each `<hash>`, `first_seen`, `fuzzer`, `hit_count`, `top_frame`.
 
@@ -41,7 +42,7 @@ fuzzer host/VM.
    d. Look up source at `top_frame` (GDB output shows file:line already).
       Optional: read a few lines of context with:
       ```
-      sed -n '<start>,<end>p' ~/fuzzing/targets/<target>/src/<file>
+      bash shared/run-on-fuzz-host.sh 'sed -n "<start>,<end>p" "$HOME/fuzzing/targets/<target>/src/<file>"'
       ```
 
 4. **Recommend action** — per crash, pick one:

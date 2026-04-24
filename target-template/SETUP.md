@@ -56,3 +56,21 @@ input validation gotchas, checksums to bypass, persistent-mode notes, etc.)_
 ## Known bugs found
 
 _(Link to upstream bug reports + triaged hashes here as you file them.)_
+
+## Safe to commit
+
+Safe to commit/push from this host-side setup dir:
+
+- `SETUP.md`
+- `scripts/*.sh`
+- `scripts/*.dict`
+- `scripts/*-fuzz.service`
+- `scripts/apt-packages.txt`
+
+Do not commit runtime artifacts from the fuzz host:
+
+- `src/`
+- `build-afl*/`
+- `seeds/raw/` or `seeds/corpus.min/` if they become large/generated
+- `findings/`
+- `crashes-triaged/`

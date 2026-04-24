@@ -10,8 +10,9 @@ Parse the invocation arguments as `<hash> <target>`.
    ```bash
    hash="${HASH:?hash required}"
    target="${TARGET:?target required}"
-   orb -m fuzzer cat  "$HOME/fuzzing/targets/${target}/crashes-triaged/${hash}/meta.json"
-   orb -m fuzzer head -120 "$HOME/fuzzing/targets/${target}/crashes-triaged/${hash}/trace.txt"
+   runner="$(git rev-parse --show-toplevel 2>/dev/null || echo .)/shared/run-on-fuzz-host.sh"
+   bash "$runner" "cat \"\$HOME/fuzzing/targets/${target}/crashes-triaged/${hash}/meta.json\""
+   bash "$runner" "head -120 \"\$HOME/fuzzing/targets/${target}/crashes-triaged/${hash}/trace.txt\""
    ```
 
 2. Apply the `fuzz-crash-review` skill's per-crash workflow (classify,

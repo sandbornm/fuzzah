@@ -12,11 +12,21 @@
 #   echo reviewed > ~/fuzzing/targets/<target>/crashes-triaged/<hash>/.status
 set -uo pipefail
 
-TARGETS_DIR="${TARGETS_DIR:-$HOME/fuzzing/targets}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RUN_ON_FUZZ_HOST="$SCRIPT_DIR/run-on-fuzz-host.sh"
+SELF_PATH="$SCRIPT_DIR/$(basename "$0")"
 
+if [[ "$(uname -s)" != "Linux" || ! -d "$HOME/fuzzing" ]]; then
+  exec "$RUN_ON_FUZZ_HOST" \
+    "if [[ -f \"$SELF_PATH\" ]]; then bash \"$SELF_PATH\"; else bash \"\$HOME/fuzzig-shared/check-in.sh\"; fi"
+fi
+
+TARGETS_DIR="${TARGETS_DIR:-$HOME/fuzzing/targets}"
 if [[ ! -d "$TARGETS_DIR" ]]; then
-  echo "no targets dir at $TARGETS_DIR" >&2
-  exit 1
+  echo "=== Fuzz check-in @ $(date +'%Y-%m-%d %H:%M:%S') ==="
+  echo
+  echo "no targets yet under $TARGETS_DIR"
+  exit 0
 fi
 
 declare -A STATE_CRASHES  # "state|target|hash|top_frame|first_seen|hit" lines, indexed by state
@@ -40,13 +50,16 @@ for tdir in "$TARGETS_DIR"/*/; do
   target="$(basename "$tdir")"
   total_targets=$((total_targets + 1))
 
-  n_fuzz=$(pgrep -fc "afl-fuzz.*targets/$target" 2>/dev/null || echo 0)
+  n_fuzz="$(pgrep -fc "afl-fuzz.*targets/$target" 2>/dev/null || true)"
+  n_fuzz="$(printf '%s' "$n_fuzz" | tr -cd '0-9')"
+  n_fuzz="${n_fuzz:-0}"
 
   # execs/sec via afl-whatsup
   execs=0
   if [[ -d "$tdir/findings" ]] && command -v "$HOME/fuzzing/tools/AFLplusplus/afl-whatsup" >/dev/null; then
     execs=$("$HOME/fuzzing/tools/AFLplusplus/afl-whatsup" -s "$tdir/findings" 2>/dev/null \
-      | awk -F': *' '/Cumulative speed/ {gsub(/[^0-9].*/,"",$2); print $2; exit}' || echo 0)
+      | awk -F': *' '/Cumulative speed/ {gsub(/[^0-9].*/,"",$2); print $2; exit}' || true)
+    execs="$(printf '%s' "$execs" | tr -cd '0-9')"
     execs="${execs:-0}"
   fi
 

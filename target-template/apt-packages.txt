@@ -1,0 +1,7 @@
+# Optional extra apt packages for this target.
+# One package per line. Blank lines and comments are ignored.
+#
+# Examples:
+#   autoconf
+#   automake
+#   libtool

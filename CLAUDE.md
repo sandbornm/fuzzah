@@ -71,9 +71,14 @@
 /fuzz-review <hash> <target>
 
 # Or ad-hoc, without a slash command:
-orb -m fuzzer bash ~/fuzzing/targets/<target>/scripts/status.sh
-orb -m fuzzer cat  ~/fuzzing/targets/<target>/crashes-triaged/INDEX.md
+bash shared/run-on-fuzz-host.sh 'bash "$HOME/fuzzing/targets/<target>/scripts/status.sh"'
+bash shared/run-on-fuzz-host.sh 'cat "$HOME/fuzzing/targets/<target>/crashes-triaged/INDEX.md"'
+bash shared/inspect-target.sh <target>
 ```
+
+If OrbStack is unhealthy on macOS, use `bash shared/orb-debug.sh`. Treat
+`orbctl status` as advisory only; a wedged helper can still report `Stopped`
+while the backend has partially started.
 
 ### Crash workflow state
 
@@ -91,8 +96,8 @@ buckets crashes by this. Default when absent is `new`.
 
 Mark a crash:
 ```sh
-orb -m fuzzer bash -c \
-  'echo reviewed > ~/fuzzing/targets/<target>/crashes-triaged/<hash>/.status'
+bash shared/run-on-fuzz-host.sh \
+  'echo reviewed > "$HOME/fuzzing/targets/<target>/crashes-triaged/<hash>/.status"'
 ```
 
 ## Adding a new target
@@ -101,6 +106,12 @@ Invoke the `fuzz-add-target` skill — it walks the full pipeline (seeds →
 3 builds → cmin → triage → systemd). Works for cmake, autoconf, meson, and
 custom build systems. Copies `target-template/` into a per-target scripts
 dir and guides the edits.
+
+For manual setup, prefer the helpers in `shared/`:
+
+- `scaffold-target.sh <target>`
+- `sync-target.sh <target>`
+- `bootstrap-target.sh <target>`
 
 ## Where Claude-specific config lives
 

@@ -11,6 +11,45 @@ watchdog that respawns anything that dies. Two commands — `check-in`
 ("are we finding bugs?") and `rig-check` ("is the box healthy?") — tell
 you everything you need in under a second.
 
+## Expected layout
+
+`fuzzah` assumes a strict split between control-plane files and runtime state:
+
+```text
+<control-root>/
+  fuzzah/                    # reusable toolkit repo
+    shared/
+    target-template/         # blank per-target script pack
+    examples/                # filled-in illustrations of target-template
+    .agents/skills/
+    .claude/{commands,skills}/
+  <target>-setup/            # host-side, versioned target setup
+    SETUP.md
+    scripts/
+
+$HOME/fuzzig-shared/         # installed shared scripts on the fuzz host
+  check-in.sh
+  rig-check.sh
+  fuzz-watchdog.sh
+
+$HOME/fuzzing/               # live runtime state on the fuzz host
+  tools/AFLplusplus/
+  targets/<target>/
+    src/
+    build-afl/
+    build-afl-asan/
+    build-afl-cmplog/
+    seeds/
+    findings/
+    crashes-triaged/
+    scripts/
+    SETUP.md
+```
+
+The helpers under `shared/` assume that shape. If you keep `fuzzah/` nested
+inside a larger control-plane repo, set `FUZZAH_CONTROL_ROOT` or rely on the
+current parent-directory auto-detection.
+
 ## Is this for me?
 
 **Yes**, if you want long-lived fuzz rigs that survive OOMs, reboots,
@@ -92,6 +131,28 @@ bash shared/rig-check.sh
 
 Done. `rig-check` will report "no targets yet" until you add one (next section).
 
+For any command that should run on the fuzz host, prefer:
+
+```sh
+bash shared/run-on-fuzz-host.sh '<command that should run on the fuzz host>'
+```
+
+It auto-detects direct Linux vs Orb-on-macOS and makes sure `$HOME` expands on
+the fuzz host.
+
+If OrbStack is present but unhealthy, this wrapper now prints a diagnostic hint
+instead of silently assuming the proxy path works. For a focused host-side
+debug snapshot, run:
+
+```sh
+bash shared/orb-debug.sh
+```
+
+If you keep target setup dirs outside the `fuzzah/` repo itself, set
+`FUZZAH_CONTROL_ROOT=/path/to/control-plane`. If `fuzzah/` is nested under a
+larger control-plane repo that has `AGENTS.md` / `CLAUDE.md` at the parent
+level, the helpers auto-detect that parent as the control root.
+
 ### Path B — Linux host (bare metal, VM, cloud box)
 
 SSH into the host, then:
@@ -147,17 +208,24 @@ Copy the per-target template and edit four files. Assume target name
 `mytool`:
 
 ```sh
-# Copy the template into the host's target dir
-orb -m fuzzer mkdir -p $HOME/fuzzing/targets/mytool/scripts
-orb -m fuzzer cp $PWD/target-template/* $HOME/fuzzing/targets/mytool/scripts/
-orb -m fuzzer mv $HOME/fuzzing/targets/mytool/scripts/TARGET-fuzz.service \
-                  $HOME/fuzzing/targets/mytool/scripts/mytool-fuzz.service
-orb -m fuzzer sed -i 's/<TARGET>/mytool/g' \
-  $HOME/fuzzing/targets/mytool/scripts/mytool-fuzz.service
+# Create a host-side editable setup dir.
+bash shared/scaffold-target.sh mytool
+
+# Sync that setup dir into the fuzz host.
+bash shared/sync-target.sh mytool
 ```
 
-Now edit these four files in the target's `scripts/` dir (every other
-script auto-derives the target name from its filesystem location):
+By default this creates:
+
+```sh
+<control-root>/mytool-setup/
+  SETUP.md
+  scripts/
+```
+
+Now edit these files in the host-side `mytool-setup/scripts/` dir
+(every other script auto-derives the target name from its filesystem
+location):
 
 | file              | what to set                                                                 |
 |-------------------|-----------------------------------------------------------------------------|
@@ -165,19 +233,13 @@ script auto-derives the target name from its filesystem location):
 | `build-afl-fast.sh` | Uncomment your build system (autoconf / cmake / meson), set `SRC_GIT_URL`; mirror into `build-afl-asan.sh` and `build-afl-cmplog.sh` |
 | `fetch-seeds.sh`  | Fill `SOURCES=()` with 2–5 seed repos: `label|url|extension`                |
 | `filter-seeds.sh` | Set `VALID_MAGIC_HEX` (e.g. `"25504446"` for PDF) and `VALID_EXTENSIONS`   |
+| `apt-packages.txt` | Optional extra Debian packages for this target's build (one per line)      |
 
 Then bootstrap and launch:
 
 ```sh
-orb -m fuzzer bash -c '
-  cd $HOME/fuzzing/targets/mytool/scripts
-  bash harden.sh && bash fetch-seeds.sh && bash filter-seeds.sh
-  bash build-afl-fast.sh && bash build-afl-asan.sh && bash build-afl-cmplog.sh
-  bash min-corpus.sh
-'
-
-orb -m fuzzer systemctl --user daemon-reload
-orb -m fuzzer systemctl --user enable --now mytool-fuzz.service
+# One command for sync + seed prep + 3 builds + cmin + systemd start.
+bash shared/bootstrap-target.sh mytool
 
 # Wait ~30 s for calibration, then:
 bash shared/check-in.sh
@@ -185,6 +247,44 @@ bash shared/check-in.sh
 ```
 
 Every step is idempotent; re-run the one that failed after fixing the edit.
+
+Before you bootstrap, inspect the target summary:
+
+```sh
+bash shared/inspect-target.sh mytool
+```
+
+## AFL++ assumptions
+
+This toolkit is intentionally opinionated around a baseline AFL++ workflow:
+
+- fast build
+- ASAN build
+- CMPLOG build
+- three long-lived workers (`primary`, `asan`, `explore`)
+- dictionary support via `scripts/<target>.dict`
+- seed scraping, filtering, and corpus minimization
+- crash triage via ASAN/GDB-style post-processing
+
+That baseline is what the current helpers, skills, watchdog, and review flow
+understand.
+
+## Not first-class yet
+
+`fuzzah` does **not** currently automate grammar-aware or schema-aware target
+types as a first-class workflow. In practice that means:
+
+- no built-in custom mutator build/install flow
+- no grammar/tree sidecar directory conventions
+- no grammar-aware seed generation bootstrap
+- no mutator-specific crash replay/triage assumptions
+
+If you want to go there, use the current toolkit as the process shell and layer
+your mutator work in manually for now. Good starting points:
+
+- AFL++ custom mutators: https://aflplus.plus/docs/custom_mutators/
+- AFL++ Grammar-Mutator: https://github.com/AFLplusplus/Grammar-Mutator
+- libprotobuf-mutator: https://github.com/google/libprotobuf-mutator
 
 ---
 
@@ -221,12 +321,70 @@ new → reviewed → repro-ok → reported     (progress)
 Mark state:
 
 ```sh
-orb -m fuzzer bash -c \
-  'echo reviewed > ~/fuzzing/targets/mytool/crashes-triaged/<hash>/.status'
+bash shared/run-on-fuzz-host.sh \
+  'echo reviewed > "$HOME/fuzzing/targets/mytool/crashes-triaged/<hash>/.status"'
 ```
 
 The `fuzz-crash-review` skill (Claude + Codex) walks classification —
 loads the trace, inspects source at the top frame, recommends action.
+
+---
+
+## Orb troubleshooting
+
+On macOS, an OrbStack control-plane failure does **not** usually mean your fuzz
+state is gone. The backing disk image persists separately from the CLI state.
+
+- Orb-backed commands fail but `vmgr.log` still shows `container started`:
+  the backend likely booted, but the client/proxy path is wedged.
+- `orbctl status` says `Stopped` while the helper is alive:
+  treat `orbctl status` as advisory only and probe with a real `orb -m ...`
+  command before assuming the VM is absent.
+- `proxy dialer did not pass back a connection` or `mm_receive_fd`:
+  OrbStack is stuck in the proxy handoff path. Fully quit and relaunch the app;
+  if it persists, reboot macOS.
+- very large `OrbStack Helper vmgr` RSS on the Mac host:
+  the helper is likely wedged; quit and relaunch OrbStack before trusting any
+  status output.
+
+Useful commands:
+
+```sh
+bash shared/orb-debug.sh
+bash shared/rig-check.sh
+```
+
+On macOS, the persisted OrbStack disk image is usually under:
+
+```sh
+$HOME/Library/Group Containers/*.dev.orbstack/data/data.img.raw
+```
+
+That image is where your `~/fuzzing/targets/*/{findings,crashes-triaged}` data
+lives, so access failures are usually a control-plane problem rather than a
+data-loss event.
+
+---
+
+## What To Commit
+
+Safe to commit/push from a target setup dir like `<control-root>/poppler-setup/`
+(or one of the illustration examples under `fuzzah/examples/`, e.g.
+`fuzzah/examples/jq/`):
+
+- `SETUP.md`
+- `scripts/*.sh`
+- `scripts/*.dict`
+- `scripts/*-fuzz.service`
+- `scripts/apt-packages.txt`
+
+Do not commit/push runtime artifacts from the fuzz host:
+
+- `src/`
+- `build-afl/`, `build-afl-asan/`, `build-afl-cmplog/`
+- large generated seed corpora
+- `findings/`
+- `crashes-triaged/`
 
 ---
 
@@ -257,9 +415,11 @@ a dead worker silently drops a third of throughput.
 
 - **Seeds** — the biggest lever. 20 curated seeds beat 2000 random ones.
   Favor diverse samples. Re-run `min-corpus.sh` after adding any.
-- **Dict files** — drop one at `$HOME/fuzzing/tools/AFLplusplus/dictionaries/<target>.dict`
-  and `start-fuzz.sh` picks it up. AFL++ ships dicts for pdf, json, xml,
-  png, and more.
+- **Dict files** — drop one at `scripts/<target>.dict` in the target setup
+  (preferred, self-contained) or at
+  `$HOME/fuzzing/tools/AFLplusplus/dictionaries/<target>.dict`. `start-fuzz.sh`
+  now prefers the target-local file and falls back to AFL++'s shared
+  dictionaries. AFL++ ships dicts for pdf, json, xml, png, and more.
 - **Persistent-mode harness** — 10–100× execs/s on fork-heavy targets.
   Worth it if you're stuck below 1k execs/s on a fast machine.
 - **Timeout** — `start-fuzz.sh` uses 3000 ms (fast) / 5000 ms (ASAN).

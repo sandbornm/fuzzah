@@ -1,7 +1,7 @@
 ---
 description: List all unique triaged crashes for a fuzz target from its INDEX.md.
 argument-hint: "<target>"
-allowed-tools: Bash(orb -m fuzzer:*)
+allowed-tools: Bash(orb -m fuzzer:*), Bash(bash:*)
 ---
 
 Dump the crash roster for the target.
@@ -12,7 +12,8 @@ if [[ -z "$target" ]]; then
   echo "usage: /fuzz-crashes <target>" >&2
   exit 1
 fi
-orb -m fuzzer cat "$HOME/fuzzing/targets/${target}/crashes-triaged/INDEX.md"
+bash shared/run-on-fuzz-host.sh \
+  "cat \"\$HOME/fuzzing/targets/${target}/crashes-triaged/INDEX.md\""
 ```
 
 After the table, also report:

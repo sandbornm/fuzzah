@@ -1,7 +1,7 @@
 ---
 description: Show fuzz rig status for one target — live fuzzer count, execs/sec, coverage, crashes, disk.
 argument-hint: "<target>"
-allowed-tools: Bash(orb -m fuzzer:*)
+allowed-tools: Bash(orb -m fuzzer:*), Bash(bash:*)
 ---
 
 Run the target's `status.sh` and summarize the result.
@@ -12,7 +12,8 @@ if [[ -z "$target" ]]; then
   echo "usage: /fuzz-status <target>" >&2
   exit 1
 fi
-orb -m fuzzer bash "$HOME/fuzzing/targets/${target}/scripts/status.sh"
+bash shared/run-on-fuzz-host.sh \
+  "bash \"\$HOME/fuzzing/targets/${target}/scripts/status.sh\""
 ```
 
 After running, call out anything unusual: fuzzers below expected count,

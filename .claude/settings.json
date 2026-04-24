@@ -5,7 +5,15 @@
       "Bash(orb run:*)",
       "Bash(orb ls:*)",
       "Bash(orb status:*)",
-      "Bash(orb list:*)"
+      "Bash(orb list:*)",
+      "Bash(bash shared/check-in.sh:*)",
+      "Bash(bash shared/rig-check.sh:*)",
+      "Bash(bash shared/orb-debug.sh:*)",
+      "Bash(bash shared/run-on-fuzz-host.sh:*)",
+      "Bash(bash shared/scaffold-target.sh:*)",
+      "Bash(bash shared/sync-target.sh:*)",
+      "Bash(bash shared/bootstrap-target.sh:*)",
+      "Bash(bash shared/inspect-target.sh:*)"
     ]
   }
 }

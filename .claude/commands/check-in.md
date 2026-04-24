@@ -9,12 +9,12 @@ Reports: live fuzzer count, execs/sec, unique crash count, and a breakdown of
 crashes by workflow state (new → reviewed → repro-ok → reported).
 
 ```bash
-bash "$(git rev-parse --show-toplevel 2>/dev/null || echo .)/shared/check-in.sh"
+bash shared/check-in.sh
 ```
 
 (If running from a Mac host against an orb VM, the script auto-proxies
 through orb when it detects a non-VM environment. If you prefer an explicit
-invocation: `orb -m fuzzer bash ~/fuzzig-shared/check-in.sh`.)
+invocation: `orb -m fuzzer bash -lc 'bash "$HOME/fuzzig-shared/check-in.sh"'`.)
 
 After the dashboard prints, summarize in prose:
 

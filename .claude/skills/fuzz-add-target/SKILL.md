@@ -10,9 +10,9 @@ AFL+ASAN+UBSAN / AFL+CMPLOG), a minimized seed corpus, a triage loop, and a
 systemd unit. Safe to invoke on an in-progress target — reuses existing
 state where possible.
 
-Throughout: commands are shown bare (e.g. `bash start-fuzz.sh`). If you're
-driving the rig from a host via orb, prefix with `orb -m fuzzer`. If you're
-inside the fuzzing VM/host, run them directly.
+Throughout: use `shared/run-on-fuzz-host.sh` for commands that must execute on
+the fuzz host. It auto-detects direct Linux execution vs Orb and ensures `~` /
+`$HOME` expand inside the fuzz host.
 
 ## Phase 1: Scope
 
@@ -32,22 +32,17 @@ Confirm the list back before building anything.
 
 ## Phase 2: Scaffold
 
-Copy the per-target template from the fuzzah kit into a new edit dir
-alongside the kit, and also drop it into the rig dir inside the VM:
+Prefer the helper scripts:
 
 ```
-# Host-side edit copy (version control goes here):
-mkdir -p $REPO_ROOT/<target>-setup/scripts
-cp $REPO_ROOT/fuzzah/target-template/*.sh \
-   $REPO_ROOT/fuzzah/target-template/*.service \
-   $REPO_ROOT/<target>-setup/scripts/
-
-# VM-side runtime install:
-mkdir -p ~/fuzzing/targets/<target>/scripts
-cp $REPO_ROOT/<target>-setup/scripts/* ~/fuzzing/targets/<target>/scripts/
+bash shared/scaffold-target.sh <target>
+bash shared/sync-target.sh <target>
 ```
 
-Rename the systemd unit: `mv TARGET-fuzz.service <target>-fuzz.service`.
+`scaffold-target.sh` creates the host-side edit copy under the detected
+control root (`FUZZAH_CONTROL_ROOT` if set, otherwise the parent repo if
+`fuzzah/` is nested there). `sync-target.sh` pushes `SETUP.md` plus the
+`scripts/` tree into `~/fuzzing/targets/<target>/` on the fuzz host.
 
 ## Phase 3: Edit the small set of per-target values
 
@@ -89,29 +84,38 @@ Each build must end with a sanity check (run the binary on one seed).
 
 ## Phase 5: Execute the pipeline
 
-Inside the VM, from `~/fuzzing/targets/<target>/scripts/`:
+Prefer the one-shot helper:
 
 ```
-bash harden.sh            # one-time: core_pattern, egress, tool deps
-bash fetch-seeds.sh       # clone upstream seed sources into seeds/raw/
-bash filter-seeds.sh      # magic-byte + size + dedupe → seeds/corpus/
-bash build-afl-fast.sh    # ~2–5 min per build on modern hardware
-bash build-afl-asan.sh
-bash build-afl-cmplog.sh
-bash min-corpus.sh        # afl-cmin → seeds/corpus.min/
+bash shared/bootstrap-target.sh <target>
+```
+
+This runs sync + harden + seed prep + the three builds + cmin + systemd
+enable/start.
+
+If you need to debug manually, run one phase at a time through the wrapper:
+
+```
+bash shared/run-on-fuzz-host.sh 'cd "$HOME/fuzzing/targets/<target>/scripts" && bash harden.sh'
+bash shared/run-on-fuzz-host.sh 'cd "$HOME/fuzzing/targets/<target>/scripts" && bash fetch-seeds.sh'
+bash shared/run-on-fuzz-host.sh 'cd "$HOME/fuzzing/targets/<target>/scripts" && bash filter-seeds.sh'
+bash shared/run-on-fuzz-host.sh 'cd "$HOME/fuzzing/targets/<target>/scripts" && bash build-afl-fast.sh'
+bash shared/run-on-fuzz-host.sh 'cd "$HOME/fuzzing/targets/<target>/scripts" && bash build-afl-asan.sh'
+bash shared/run-on-fuzz-host.sh 'cd "$HOME/fuzzing/targets/<target>/scripts" && bash build-afl-cmplog.sh'
+bash shared/run-on-fuzz-host.sh 'cd "$HOME/fuzzing/targets/<target>/scripts" && bash min-corpus.sh'
 ```
 
 Then bring up the rig:
 ```
-bash ~/fuzzing/targets/<target>/scripts/start-fuzz.sh
+bash shared/run-on-fuzz-host.sh 'bash "$HOME/fuzzing/targets/<target>/scripts/start-fuzz.sh"'
 ```
 
 ## Phase 6: Systemd unit
 
 Rename the template unit to match the target and install:
 ```
-cp ~/fuzzing/targets/<target>/scripts/<target>-fuzz.service \
-   ~/.config/systemd/user/
+cp "$HOME/fuzzing/targets/<target>/scripts/<target>-fuzz.service" \
+   "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
 systemctl --user enable --now <target>-fuzz.service
 ```

@@ -33,8 +33,17 @@ HARNESS_SUBPATH="REPLACE_WITH_BINARY_SUBPATH"
 #   "-"                     (stdin-only target — no @@)
 HARNESS_ARGS="@@ /dev/null"
 
-# Dict file (optional). If $DICT is a readable file, -x $DICT is appended.
-DICT="${AFL_DIR}/dictionaries/${TARGET_NAME}.dict"
+# Dict file (optional). Prefer a target-local dictionary in scripts/ so the
+# target setup is self-contained; fall back to AFL++'s shared dictionaries.
+SCRIPT_DICT="$SCRIPT_DIR/${TARGET_NAME}.dict"
+AFL_DICT="$AFL_DIR/dictionaries/${TARGET_NAME}.dict"
+if [[ -z "${DICT:-}" ]]; then
+  if [[ -f "$SCRIPT_DICT" ]]; then
+    DICT="$SCRIPT_DICT"
+  else
+    DICT="$AFL_DICT"
+  fi
+fi
 # ══════════════════════════════════════════════════════════════════════════
 
 # Process-match patterns used in pgrep scoping (so this target's kills don't

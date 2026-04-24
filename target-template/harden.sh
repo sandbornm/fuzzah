@@ -37,8 +37,17 @@ MISSING=()
 for pkg in jq gdb nftables tmux; do
   dpkg -s "$pkg" >/dev/null 2>&1 || MISSING+=("$pkg")
 done
+EXTRA_PACKAGES_FILE="$SCRIPT_DIR/apt-packages.txt"
+if [[ -f "$EXTRA_PACKAGES_FILE" ]]; then
+  while IFS= read -r pkg; do
+    pkg="${pkg%%#*}"
+    pkg="$(printf '%s' "$pkg" | xargs)"
+    [[ -z "$pkg" ]] && continue
+    dpkg -s "$pkg" >/dev/null 2>&1 || MISSING+=("$pkg")
+  done < "$EXTRA_PACKAGES_FILE"
+fi
 if (( ${#MISSING[@]} > 0 )); then
-  echo "    installing: ${MISSING[*]}"
+    echo "    installing: ${MISSING[*]}"
   sudo apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING[@]}" >/dev/null
 fi
