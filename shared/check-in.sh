@@ -50,9 +50,20 @@ for tdir in "$TARGETS_DIR"/*/; do
   target="$(basename "$tdir")"
   total_targets=$((total_targets + 1))
 
-  n_fuzz="$(pgrep -fc "afl-fuzz.*targets/$target" 2>/dev/null || true)"
-  n_fuzz="$(printf '%s' "$n_fuzz" | tr -cd '0-9')"
-  n_fuzz="${n_fuzz:-0}"
+  # Count live fuzzers by reading fuzzer_pid from each fuzzer_stats file and
+  # probing it with kill -0. pgrep counts processes by pattern but can't
+  # distinguish stale fuzzer_stats files left behind by a crashed afl-fuzz
+  # from truly running ones — regression seen 2026-04-23 poppler outage where
+  # crashed workers left stale stats and over-reported fuzzers alive.
+  n_fuzz=0
+  if [[ -d "$tdir/findings" ]]; then
+    while IFS= read -r stats; do
+      pid="$(awk '/^fuzzer_pid/ {print $3; exit}' "$stats" 2>/dev/null)"
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        n_fuzz=$((n_fuzz + 1))
+      fi
+    done < <(find "$tdir/findings" -maxdepth 2 -name "fuzzer_stats" 2>/dev/null)
+  fi
 
   # execs/sec via afl-whatsup
   execs=0
