@@ -297,6 +297,10 @@ bash shared/check-in.sh    # fuzz domain: crashes, workflow state
 bash shared/rig-check.sh   # system domain: memory, OOM, systemd, disk
 ```
 
+The fuzzers-alive count shown by `check-in.sh` is verified via `fuzzer_pid` +
+`kill -0` (not pgrep), so stale `fuzzer_stats` files left by a crashed worker
+do not inflate the count.
+
 Or from an agent session:
 
 | task                    | Claude Code                    | Codex                         |

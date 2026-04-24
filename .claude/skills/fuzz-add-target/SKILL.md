@@ -149,3 +149,10 @@ systemctl --user enable --now <target>-fuzz.service
 - **Egress block** — `harden.sh` may set nftables rules that affect the
   host VM-wide. If a later target needs network for seed fetch, temporarily
   allow tcp/443 during fetch-seeds, then restore the block.
+- **`start-fuzz.sh` launch logs** — `ensure_window` now polls `fuzzer_stats`
+  and confirms the pid via `kill -0` before logging success. For fuzzer roles
+  (primary / asan / explore), success prints `[+] launched <role> (pid N)`;
+  if the process fails to stabilize within the budget (30–45 s depending on
+  role), it prints `[!] <role> failed to survive launch — fuzzer_stats never
+  showed a live pid within Ns` and exits non-zero. For non-fuzzer roles
+  (triage, status), `[+] launched <role>` is immediate (no poll).

@@ -55,16 +55,23 @@ cp fuzzah/examples/"$NAME"/scripts/"$NAME"-fuzz.service.example "$NAME"-setup/sc
 
 # 2. Bootstrap — sync to host, harden, seed, 3 builds, cmin, enable+start systemd.
 bash fuzzah/shared/bootstrap-target.sh "$NAME"
+# *** Gotcha: if you previously ran `harden.sh --block-egress` on this host,
+# temporarily remove the egress block before this step (nftables rule blocks
+# `git clone` in fetch-seeds.sh and `apt install` for apt-packages.txt), then
+# re-apply it after the initial seeds and packages are fetched.  If you see
+# fetch-seeds.sh hang or fail with a network error, this is the cause. ***
 
 # 3. Verify.
 bash shared/run-on-fuzz-host.sh 'bash "$HOME/fuzzing/targets/'"$NAME"'/scripts/status.sh"'
 #   or just:   /fuzz-status jq-filter    (Claude)   /   $fuzz-status jq-filter   (Codex)
 ```
 
-Expect 3 fuzzers alive and nonzero execs/sec within ~2 minutes. If step 2
-fails at the build stage, re-run the individual phase manually (see the
-fuller list of `run-on-fuzz-host.sh` invocations in `fuzz-add-target`
-skill).
+Expect 3 fuzzers alive and nonzero execs/sec within ~2 minutes. The
+fuzzers-alive count in `/check-in` is verified via `fuzzer_pid` + `kill -0`
+(not pgrep), so it reflects truly-alive processes rather than stale stats
+files. If step 2 fails at the build stage, re-run the individual phase
+manually (see the fuller list of `run-on-fuzz-host.sh` invocations in
+`fuzz-add-target` skill).
 
 ## Keeping examples fresh
 
