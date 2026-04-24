@@ -63,6 +63,12 @@ A shared `fuzz-watchdog.timer` (user systemd, fires every 5 min) re-invokes
 every target's `start-fuzz.sh` — idempotent, only restarts roles that died
 (e.g. OOM). Logs at `~/fuzzing/logs/watchdog.log`.
 
+For fuzzer roles (`primary`, `asan`, `explore`), `start-fuzz.sh` does not log
+success immediately after sending commands to tmux. It waits for that role's
+`findings/<role>/fuzzer_stats`, reads `fuzzer_pid`, and verifies the process
+with `kill -0`; startup failure exits non-zero instead of reporting a false
+`[+] launched`.
+
 ## Skills (Codex)
 
 Invoke as `$skill-name`:
@@ -109,6 +115,10 @@ bash shared/inspect-target.sh <target>
 
 `shared/run-on-fuzz-host.sh` auto-detects direct Linux execution vs Orb and
 ensures `~` / `$HOME` expand on the fuzz host.
+
+`shared/check-in.sh` also counts fuzzers from `fuzzer_stats` `fuzzer_pid` plus
+`kill -0`, not broad process-name matching, so stale AFL stats files do not
+inflate the alive count.
 
 If OrbStack is unhealthy on macOS, use `bash shared/orb-debug.sh`. Do not
 assume `orbctl status` is authoritative by itself; a wedged helper can report
