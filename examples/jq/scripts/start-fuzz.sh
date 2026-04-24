@@ -33,8 +33,8 @@ HARNESS_SUBPATH="jq"
 #   "-"                     (stdin-only target — no @@)
 HARNESS_ARGS=". @@ >/dev/null"
 
-# Dict file (optional). Prefer a target-local dictionary in scripts/ so this
-# setup works without mutating the shared AFL++ install.
+# Dict file (optional). Prefer a target-local dictionary in scripts/ so the
+# target setup is self-contained; fall back to AFL++'s shared dictionaries.
 SCRIPT_DICT="$SCRIPT_DIR/${TARGET_NAME}.dict"
 AFL_DICT="$AFL_DIR/dictionaries/${TARGET_NAME}.dict"
 if [[ -z "${DICT:-}" ]]; then
@@ -89,12 +89,49 @@ ensure_window() {
   local name="$1" cmd="$2"
   if is_role_running "$name"; then
     echo "[=] $name already running, skipping"
-    return
+    return 0
   fi
   tmux kill-window -t "${SESSION}:${name}" 2>/dev/null || true
   tmux new-window -t "$SESSION" -n "$name"
   tmux send-keys -t "${SESSION}:${name}" "$cmd" Enter
-  echo "[+] launched $name"
+
+  # For AFL fuzzer roles, poll fuzzer_stats to confirm the process actually
+  # survived startup. send-keys only queues keystrokes; it doesn't wait for
+  # the spawned process to come up, let alone stay up. This is the fix for
+  # the 2026-04-23 "optimistic launched" outage — see
+  # reports/2026-04-23-poppler-watchdog-cgroup-kill.md.
+  case "$name" in
+    primary|asan|explore)
+      local stats="$FIND/$name/fuzzer_stats"
+      # Role-specific deadline: asan+explore include a leading sleep in their
+      # tmux command strings (5s and 10s respectively). Budget for that plus
+      # ASAN shadow-memory setup time on a memory-pressured VM.
+      local budget
+      case "$name" in
+        asan)    budget=45 ;;
+        explore) budget=40 ;;
+        *)       budget=30 ;;
+      esac
+      local deadline=$((SECONDS + budget))
+      local pid=""
+      while (( SECONDS < deadline )); do
+        if [[ -s "$stats" ]] && grep -q '^fuzzer_pid' "$stats" 2>/dev/null; then
+          pid="$(awk '/^fuzzer_pid/ {print $3; exit}' "$stats")"
+          if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "[+] launched $name (pid $pid)"
+            return 0
+          fi
+        fi
+        sleep 1
+      done
+      echo "[!] $name failed to survive launch — fuzzer_stats never showed a live pid within ${budget}s"
+      return 1
+      ;;
+    *)
+      echo "[+] launched $name"
+      return 0
+      ;;
+  esac
 }
 
 # Master (primary) — fast build, cmplog companion, 1 GB memlimit.
