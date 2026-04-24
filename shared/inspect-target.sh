@@ -87,6 +87,7 @@ array_length() {
     printf '0\n'
     return 0
   fi
+  # shellcheck disable=SC1087  # indirect array ref: ${#name[@]} is intentional
   eval "len=\${#$name[@]}"
   printf '%s\n' "$len"
 }
@@ -101,6 +102,7 @@ print_array() {
   fi
   echo "  $prefix:"
   for ((i = 0; i < len; i++)); do
+    # shellcheck disable=SC1087  # indirect array ref: ${name[i]} is intentional
     eval "item=\${$name[$i]}"
     echo "    - $item"
   done
@@ -141,6 +143,7 @@ SRC_GIT_REF="$(normalize_value "$SRC_GIT_REF")"
 read_into_array SOURCES list_array_entries "$FETCH_SH" SOURCES
 read_into_array VALID_EXTENSIONS list_array_entries "$FILTER_SH" VALID_EXTENSIONS
 read_into_array VALID_MAGIC list_array_entries "$FILTER_SH" VALID_MAGIC_HEX
+# shellcheck disable=SC2016  # awk expression in single quotes is intentional
 read_into_array APT_PACKAGES awk 'NF && $1 !~ /^#/' "$APT_FILE"
 PLACEHOLDERS=()
 if [[ "${SRC_GIT_URL:-}" == *REPLACE_WITH* || "${SRC_GIT_URL:-}" == *REPLACE_ME* ]]; then
@@ -151,18 +154,21 @@ if [[ "${SRC_GIT_REF:-}" == *REPLACE_WITH* || "${SRC_GIT_REF:-}" == *REPLACE_ME*
 fi
 for ((i = 0; i < $(array_length SOURCES); i++)); do
   eval "source=\${SOURCES[$i]}"
+  # shellcheck disable=SC2154  # source is assigned by eval above
   if [[ "$source" == *REPLACE_WITH* || "$source" == *REPLACE_ME* ]]; then
     PLACEHOLDERS+=("fetch-seeds.sh: SOURCES contains a placeholder entry: $source")
   fi
 done
 for ((i = 0; i < $(array_length VALID_EXTENSIONS); i++)); do
   eval "ext=\${VALID_EXTENSIONS[$i]}"
+  # shellcheck disable=SC2154  # ext is assigned by eval above
   if [[ "$ext" == *REPLACE_WITH* || "$ext" == *REPLACE_ME* ]]; then
     PLACEHOLDERS+=("filter-seeds.sh: VALID_EXTENSIONS contains a placeholder entry: $ext")
   fi
 done
 for ((i = 0; i < $(array_length VALID_MAGIC); i++)); do
   eval "magic=\${VALID_MAGIC[$i]}"
+  # shellcheck disable=SC2154  # magic is assigned by eval above
   if [[ "$magic" == *REPLACE_WITH* || "$magic" == *REPLACE_ME* ]]; then
     PLACEHOLDERS+=("filter-seeds.sh: VALID_MAGIC_HEX contains a placeholder entry: $magic")
   fi

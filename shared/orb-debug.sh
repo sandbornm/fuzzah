@@ -52,6 +52,7 @@ echo "OrbStack:"
 echo "  version: ${orb_version:-unavailable}"
 echo "  status:  ${orb_status:-unavailable}"
 
+# shellcheck disable=SC2009  # pgrep cannot filter by full command substring here
 if ps_out="$(ps ax -o pid=,etime=,rss=,command= 2>/dev/null | grep 'OrbStack Helper vmgr' | grep -v grep | head -1)"; then
   if [[ -n "$ps_out" ]]; then
     echo "  vmgr:    $ps_out"
@@ -85,6 +86,7 @@ if [[ -f "$VMGR_LOG" ]]; then
     'startup phase|container=fuzzer|container started|failed to add forward|proxy dialer did not pass back a connection|mm_receive_fd|Unknown Rosetta version|host-unix forward|update available' \
     "$VMGR_LOG" 2>/dev/null | tail -30)"
   if [[ -n "$markers" ]]; then
+    # shellcheck disable=SC2001  # sed prefix-indent; ${var//...} can't do multiline prepend
     echo "$markers" | sed 's/^/  /'
   else
     echo "  (no matching markers)"

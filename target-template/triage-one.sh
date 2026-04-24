@@ -153,6 +153,7 @@ if [[ "$TOP_FRAME" == memlimit-kill* ]]; then
   echo ignore > "$DEST/.status"
 fi
 
+# shellcheck disable=SC2016  # printf format in single quotes is correct; %s are format specs not vars
 printf '| `%s` | %s | %s | 1 | `%s` |\n' "$HASH" "$TS" "$FUZZER_NAME" "$TOP_FRAME" >> "$INDEX"
 
 echo "[+] new crash $HASH ($TOP_FRAME)"

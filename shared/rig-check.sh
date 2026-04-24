@@ -97,6 +97,7 @@ fi
 # directory listing (no hardcoded target list), so this script is target-
 # agnostic — drop a new target in $HOME/fuzzing/targets/<name>/ and it works.
 targets=()
+# shellcheck disable=SC2016  # $HOME must expand on the remote host, not locally
 while IFS= read -r t; do
   [[ -n "$t" ]] && targets+=("$t")
 done < <(vm 'ls -1 "$HOME/fuzzing/targets" 2>/dev/null' | tr -d '\r')
@@ -164,6 +165,7 @@ oom_count="$(echo "$oom_lines" | awk 'NF' | wc -l)"
 if [[ "$oom_count" -eq 0 ]]; then
   echo "  (none detected)"
 else
+  # shellcheck disable=SC2001  # sed prefix-indent; ${var//...} can't do multiline prepend
   echo "$oom_lines" | sed 's/^/  /'
   if [[ "$oom_count" -ge 5 ]]; then
     echo "  [!] $oom_count OOM kills in dmesg ring — check whether -m caps are missing on any fuzzer / afl-tmin invocation"
@@ -196,6 +198,7 @@ else
 fi
 if [[ -n "$spurious" ]]; then
   echo "Spurious kernel signals:"
+  # shellcheck disable=SC2001  # sed prefix-indent; ${var//...} can't do multiline prepend
   echo "$spurious" | sed 's/^/  /'
 else
   echo "Spurious kernel signals: none"

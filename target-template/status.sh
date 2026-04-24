@@ -37,6 +37,7 @@ if [[ -d "$TRIAGE" ]]; then
   echo "triaged unique crashes: $n_unique"
   if (( n_unique > 0 )); then
     echo "most recent 5:"
+    # shellcheck disable=SC2012  # ls -t for mtime sort; find has no portable -mtime sort
     ls -1t "$TRIAGE"/*/meta.json 2>/dev/null | head -5 | while read -r m; do
       h=$(basename "$(dirname "$m")")
       top=$(jq -r '.top_frame // "?"' "$m" 2>/dev/null || echo '?')
