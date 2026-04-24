@@ -1,0 +1,12 @@
+autoconf
+automake
+bison
+build-essential
+clang
+flex
+git
+libtool
+llvm
+lld
+make
+pkg-config

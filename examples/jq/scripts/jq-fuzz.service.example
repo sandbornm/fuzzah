@@ -1,0 +1,22 @@
+[Unit]
+Description=jq fuzz rig (AFL++) — primary + asan + explore + triage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# start-fuzz.sh launches tmux windows and exits; fuzzers keep running in tmux.
+RemainAfterExit=true
+
+# harden.sh is idempotent. If you want this unit to also apply the egress
+# block, append `--block-egress` to the line below.
+ExecStartPre=/bin/bash -c '%h/fuzzing/targets/jq/scripts/harden.sh'
+
+ExecStart=/bin/bash %h/fuzzing/targets/jq/scripts/start-fuzz.sh
+ExecStop=/bin/bash  %h/fuzzing/targets/jq/scripts/stop-fuzz.sh
+
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=default.target
