@@ -26,7 +26,10 @@ for sf in "$TARGETS_DIR"/*/scripts/start-fuzz.sh; do
       echo "$out" | grep -E '^\[[+=]\]' | sed 's/^/  /' >> "$LOG"
     fi
   else
-    echo "[watchdog] $(date -Iseconds) $target: start-fuzz.sh failed (exit $?)" >> "$LOG"
+    # Capture rc BEFORE any command substitution (incl. $(date …)) so we don't
+    # clobber $? via the log-line build.
+    rc=$?
+    echo "[watchdog] $(date -Iseconds) $target: start-fuzz.sh failed (exit $rc)" >> "$LOG"
     echo "$out" | tail -10 | sed 's/^/  /' >> "$LOG"
   fi
 done

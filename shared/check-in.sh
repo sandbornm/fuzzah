@@ -102,7 +102,7 @@ echo
 echo "totals: $total_targets target(s), $total_crashes unique crash(es)"
 
 render_state() {
-  local state="$1" label="$2"
+  local state="$1"
   local blob="${STATE_CRASHES[$state]:-}"
   [[ -z "$blob" ]] && { echo "  (none)"; return; }
   echo "$blob" | awk -F'|' 'NF>=5 {
@@ -112,15 +112,15 @@ render_state() {
 
 echo
 echo "── Needs review (state: new) ─────────────────────────────────────────"
-render_state new "new"
+render_state new
 
 echo
 echo "── Ready for repro verification (state: reviewed) ────────────────────"
-render_state reviewed "reviewed"
+render_state reviewed
 
 echo
 echo "── Ready for upstream report (state: repro-ok) ───────────────────────"
-render_state repro-ok "repro-ok"
+render_state repro-ok
 
 echo
 echo "Mark a crash:"

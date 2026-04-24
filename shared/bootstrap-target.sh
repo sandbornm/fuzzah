@@ -18,6 +18,13 @@ EOF
 
 [[ $# -eq 1 ]] || { usage >&2; exit 2; }
 TARGET="$1"
+# Validate target name — it is interpolated into remote shell commands below.
+# Restricting to a safe charset prevents arbitrary command execution on the
+# fuzz host if a caller passes an unusual target string.
+[[ "$TARGET" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+  echo "[!] invalid target name: $TARGET (allowed: alnum, dot, dash, underscore)" >&2
+  exit 2
+}
 
 bash "$SCRIPT_DIR/sync-target.sh" "$TARGET"
 

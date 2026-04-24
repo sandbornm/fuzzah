@@ -22,6 +22,11 @@ EOF
 
 [[ $# -eq 1 ]] || { usage >&2; exit 2; }
 TARGET="$1"
+# Validate target name — interpolated into a remote shell via run-on-fuzz-host.sh.
+[[ "$TARGET" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+  echo "[!] invalid target name: $TARGET (allowed: alnum, dot, dash, underscore)" >&2
+  exit 2
+}
 SETUP_ROOT="$(fuzzah_setup_root "$TARGET")"
 
 [[ -d "$SETUP_ROOT/scripts" ]] || { echo "[!] missing $SETUP_ROOT/scripts — run scaffold-target.sh first" >&2; exit 1; }

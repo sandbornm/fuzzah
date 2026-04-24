@@ -8,4 +8,10 @@ Type=oneshot
 # Low prio so the tick never steals cycles from fuzz workers.
 Nice=10
 IOSchedulingClass=idle
+# CRITICAL: KillMode=process — without this, Type=oneshot's default cgroup kill
+# would SIGTERM any tmux server this unit spawned via start-fuzz.sh when the
+# tick finishes. That caused a silent multi-hour poppler outage on 2026-04-23
+# (see reports/2026-04-23-poppler-watchdog-cgroup-kill.md). Leaving this flag
+# off means every relaunch silently kills the tmux it just created.
+KillMode=process
 ExecStart=/bin/bash %h/fuzzig-shared/fuzz-watchdog.sh

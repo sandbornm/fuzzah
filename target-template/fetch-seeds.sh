@@ -74,7 +74,7 @@ done
 echo
 echo "=== fetch summary ==="
 find "$TARGET_DIR/seeds/raw" -maxdepth 2 -mindepth 2 -type d | while read -r d; do
-  printf "  %-40s %s files\n" "${d#$TARGET_DIR/seeds/raw/}" "$(find "$d" -type f | wc -l)"
+  printf "  %-40s %s files\n" "${d#"$TARGET_DIR"/seeds/raw/}" "$(find "$d" -type f | wc -l)"
 done
 echo
 echo "Next: bash $SCRIPT_DIR/filter-seeds.sh"

@@ -9,6 +9,12 @@ Wants=network-online.target
 Type=oneshot
 # start-fuzz.sh launches tmux windows and exits; fuzzers keep running in tmux.
 RemainAfterExit=true
+# CRITICAL: KillMode=process — so `systemctl --user stop` only signals the
+# ExecStart process, not the tmux-hosted afl-fuzz children. Without this flag,
+# stopping the unit would nuke the workers before stop-fuzz.sh can run the
+# graceful shutdown. Same hazard caused a watchdog-driven outage on 2026-04-23
+# (see reports/2026-04-23-poppler-watchdog-cgroup-kill.md).
+KillMode=process
 
 # harden.sh is idempotent. If you want this unit to also apply the egress
 # block, append `--block-egress` to the line below.
