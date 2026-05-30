@@ -84,6 +84,28 @@ def vm_path(p):
     return shlex.quote(p)
 
 
+def read_reviews_ledger(target):
+    """Sum the per-target reviews ledger. Returns {count, cost_usd, seconds}.
+    Ledger is tab-separated: reviewed_at frame hash model cost_usd tok_in tok_out seconds."""
+    path = f"~/fuzzing/targets/{target}/crashes-triaged/reviews-ledger.tsv"
+    out, _, _ = run_on_host(f'cat {vm_path(path)} 2>/dev/null', timeout=10)
+    count, cost, secs = 0, 0.0, 0
+    for line in (out or "").splitlines():
+        cols = line.split("\t")
+        if len(cols) < 8:
+            continue
+        count += 1
+        try:
+            cost += float(cols[4])
+        except ValueError:
+            pass
+        try:
+            secs += int(cols[7])
+        except ValueError:
+            pass
+    return {"count": count, "cost_usd": cost, "seconds": secs}
+
+
 def fetch_check_in():
     out, err, rc = run_on_host(f'bash "$HOME/fuzzig-shared/check-in.sh" 2>&1 || bash {shlex.quote(str(CHECK_IN))} 2>&1', timeout=30)
     return out or err or f"(rc={rc})"
@@ -735,6 +757,7 @@ def render_target(target):
     crashes = sorted(crashes, key=lambda c: c['_vscore'], reverse=True)
 
     reviewed_frames = frames_reviewed(crashes)
+    ledger = CACHE.get(f"ledger:{target}", 60, lambda: read_reviews_ledger(target))
 
     bucket = {}
     crash_rows = []
@@ -828,6 +851,7 @@ def render_target(target):
 </tr>
 {''.join(crash_rows) or '<tr><td colspan=8 class="muted">no triaged crashes</td></tr>'}
 </table>
+<p class="muted">reviews: {ledger['count']} · ${ledger['cost_usd']:.2f} total · {fmt_age(ledger['seconds'])}</p>
 <script>
 function filterCrashes() {{
   var s = document.getElementById('fstatus').value.toLowerCase();

@@ -61,5 +61,22 @@ class ListReviewTests(unittest.TestCase):
         self.assertTrue(actionable)
 
 
+class LedgerTests(unittest.TestCase):
+    def test_reads_and_sums_ledger(self):
+        rows = ("2026-05-30T14:30:00-05:00\tdblToCol\t4971c05e06c1\tclaude-opus-4-8\t0.62\t13798\t3533\t48\n"
+                "2026-05-30T14:40:00-05:00\tappendfv\tee40a47038bb\tclaude-opus-4-8\t0.55\t12000\t3000\t41\n")
+        server.run_on_host = lambda cmd, timeout=20: (rows, "", 0)
+        led = server.read_reviews_ledger("poppler")
+        self.assertEqual(led["count"], 2)
+        self.assertAlmostEqual(led["cost_usd"], 1.17, places=2)
+        self.assertEqual(led["seconds"], 89)
+
+    def test_empty_ledger(self):
+        server.run_on_host = lambda cmd, timeout=20: ("", "", 0)
+        led = server.read_reviews_ledger("poppler")
+        self.assertEqual(led["count"], 0)
+        self.assertEqual(led["cost_usd"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
