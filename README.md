@@ -59,33 +59,46 @@ crashes organized for review.
 **No**, if you want a one-shot `afl-fuzz` run on a single target — just
 use AFL++ directly.
 
-## The picture
+## How it works
 
+One picture: you drive the rig three ways, it runs on one host, and every
+target is a self-contained loop that finds crashes and files them away for you.
+
+```mermaid
+flowchart TB
+    subgraph drive["Drive the rig 3 ways"]
+        direction LR
+        cli["Terminal<br/>check-in &middot; rig-check"]
+        agent["Claude Code / Codex<br/>/fuzz-status &middot; /fuzz-review"]
+        web["Browser<br/>fuhq dashboard"]
+    end
+
+    subgraph host["Fuzz host &mdash; a Linux box, or a VM on your Mac"]
+        direction TB
+        subgraph rig["One self-contained rig per target &middot; ~/fuzzing/targets/&lt;name&gt;"]
+            direction LR
+            w["3 AFL++ workers<br/>primary +cmplog &middot; asan &middot; explore"]
+            t["Triage loop<br/>dedupe by ASAN stack hash"]
+            c["crashes-triaged/&lt;hash&gt;<br/>meta &middot; trace &middot; poc"]
+            w --> t --> c
+        end
+        wd["fuzz-watchdog.timer<br/>relaunches any dead worker every 5 min"]
+        wd -. respawn .-> w
+    end
+
+    drive --> host
 ```
-┌── your host (Mac via orb, or Linux directly) ──┐
-│                                                 │
-│  $HOME/fuzzing/                                 │
-│    tools/AFLplusplus/                           │
-│    logs/watchdog.log                            │
-│    targets/<name>/                              │
-│      src/                 — upstream checkout   │
-│      build-afl/           — plain AFL build     │
-│      build-afl-asan/      — ASAN + UBSAN build  │
-│      build-afl-cmplog/    — CMPLOG companion    │
-│      seeds/corpus.min/    — minimized corpus    │
-│      findings/            — live AFL output     │
-│      crashes-triaged/     — deduped PoCs        │
-│      scripts/             — per-target automation│
-│                                                 │
-│  systemd --user:                                │
-│    <name>-fuzz.service    — target rig          │
-│    fuzz-watchdog.timer    — 5-min respawn loop  │
-│                                                 │
-│  tmux sessions:                                 │
-│    <name>-fuzz  {primary, asan, explore,        │
-│                  triage, status}                │
-└─────────────────────────────────────────────────┘
-```
+
+- **Drive it 3 ways** — the same rig is reachable from the terminal, from an AI
+  agent (Claude Code / Codex), or from the **fuhq** browser dashboard.
+- **One rig per target** — three AFL++ workers feed a triage loop that
+  deduplicates crashes by ASAN stack hash and drops each unique one into
+  `crashes-triaged/<hash>/`.
+- **Self-healing** — a 5-minute watchdog relaunches any worker that dies (OOM,
+  reboot, …), so the rig survives being left alone for weeks.
+
+The on-disk layout under `~/fuzzing/` is the directory tree shown in
+[Expected layout](#expected-layout) above.
 
 ---
 
@@ -305,11 +318,12 @@ Or from an agent session:
 
 | task                    | Claude Code                    | Codex                         |
 |-------------------------|--------------------------------|-------------------------------|
-| fuzz dashboard          | `/check-in`                    | `$check-in`                   |
+| check-in (all targets)  | `/check-in`                    | `$check-in`                   |
 | system health           | `/rig-check`                   | `$rig-check`                  |
 | one target's status     | `/fuzz-status mytool`          | `$fuzz-status mytool`         |
 | list crashes            | `/fuzz-crashes mytool`         | `$fuzz-crashes mytool`        |
 | triage one crash        | `/fuzz-review <hash> mytool`   | `$fuzz-review <hash> mytool`  |
+| browser dashboard       | `/fuzz-dashboard`              | `bash shared/fuzz-dashboard/run.sh` |
 
 ### Crash triage workflow
 
@@ -331,6 +345,46 @@ bash shared/run-on-fuzz-host.sh \
 
 The `fuzz-crash-review` skill (Claude + Codex) walks classification —
 loads the trace, inspects source at the top frame, recommends action.
+
+---
+
+## See it in your browser — the fuhq dashboard
+
+`fuhq` is a live web view of the whole rig — fuzzer health, per-target stats,
+and per-crash drill-down with a **viability score** that tells you, at a glance,
+which crashes are worth your time. It's **Python stdlib only** — nothing to
+`pip install`.
+
+**1. Start it** on the host that can reach your fuzz host (the Mac, or the Linux
+box itself):
+
+```sh
+bash shared/fuzz-dashboard/run.sh          # foreground; Ctrl-C to stop
+# from an agent session, just say:  /fuzz-dashboard
+```
+
+It binds `127.0.0.1:8765` only — never exposed to the network.
+
+**2. Open it.** On the same machine, browse to <http://localhost:8765>. From a
+different machine (e.g. the dashboard runs on a headless Linux box or your Mac
+mini), forward the port over SSH first, then browse to localhost:
+
+```sh
+ssh -L 8765:127.0.0.1:8765 <user>@<host-running-fuhq>
+# then open http://localhost:8765
+```
+
+That's the whole setup. Three pages:
+
+| page | shows |
+|------|-------|
+| `/`                     | health banner, aggregate KPIs, target list |
+| `/t/<target>`           | per-worker stats + the crash table, filterable by status and **viability** (high / med / low / noise) |
+| `/c/<target>/<hash>`    | `NOTES.md`, trace, `meta.json`, PoC hexdump + download |
+
+The crash table sorts most-viable-first, so the handful of crashes that matter
+float to the top of a list that may be hundreds long. Hover any viability tag to
+see *why* it scored that way.
 
 ---
 

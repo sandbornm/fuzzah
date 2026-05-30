@@ -74,6 +74,10 @@
 # Deep-dive review of a specific crash
 /fuzz-review <hash> <target>
 
+# Live browser dashboard (fuhq) — foreground server, Ctrl-C to stop.
+# Stdlib-only; binds 127.0.0.1:8765. SSH-forward the port to view remotely.
+/fuzz-dashboard
+
 # Or ad-hoc, without a slash command:
 bash shared/run-on-fuzz-host.sh 'bash "$HOME/fuzzing/targets/<target>/scripts/status.sh"'
 bash shared/run-on-fuzz-host.sh 'cat "$HOME/fuzzing/targets/<target>/crashes-triaged/INDEX.md"'
@@ -124,9 +128,10 @@ For manual setup, prefer the helpers in `shared/`:
 ## Where Claude-specific config lives
 
 - `.claude/skills/`           — Claude skills (fuzz-crash-review, fuzz-add-target)
-- `.claude/commands/`         — Claude slash commands (check-in, rig-check, fuzz-status, fuzz-crashes, fuzz-review)
+- `.claude/commands/`         — Claude slash commands (check-in, rig-check, fuzz-status, fuzz-crashes, fuzz-review, fuzz-dashboard)
 - `.claude/settings.json`     — pre-allowed `orb` commands (no permission prompts)
 - `shared/`                   — cross-target tooling (watchdog, check-in, rig-check)
+- `shared/fuzz-dashboard/`    — fuhq browser dashboard (stdlib `server.py` + `run.sh`)
 - `target-template/`          — the per-target script pack copied per new target
 
 Target-specific docs live in `~/fuzzing/targets/<target>/SETUP.md` on the
