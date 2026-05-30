@@ -240,32 +240,41 @@ def recommend_next_step(status, hits_str, has_notes):
 
 
 def viability(top_frame, hits_str, has_notes, status):
-    """Coarse triage-worthiness bucket → (bucket, score 0-100).
+    """Coarse triage-worthiness → (bucket, score 0-100, reason).
 
     bucket ∈ high | med | low | noise | ignore. The signal is symbolization
     plus hit count: an unsymbolized crash ("no-frames", "unknown-sig",
     "Killed.") is almost always a timeout / OOM-kill — low value. A symbolized
     top frame with a high hit count is a stable, reproducible candidate.
+    `reason` is a short plain-English sentence, shown on hover, explaining the
+    bucket so the score is never a black box.
     """
     try:
         hits = int(hits_str)
     except (TypeError, ValueError):
         hits = 0
+    frame = top_frame or "?"
     if (status or "new") in ("dup", "ignore"):
-        return ("ignore", 0)
-    tf = (top_frame or "").lower()
+        return ("ignore", 0, f"already marked '{status}' — out of the triage queue")
+    tf = frame.lower()
     symbolized = (
         bool(tf) and tf != "?"
         and "no-frames" not in tf and "unknown-sig" not in tf and "killed" not in tf
     )
+    notes_bit = " + has NOTES.md" if has_notes else ""
+    plural = "s" if hits != 1 else ""
     if not symbolized:
-        return ("noise", min(15, 5 + hits))
+        return ("noise", min(15, 5 + hits),
+                f"unsymbolized crash ({frame}) — usually a timeout or OOM-kill, rarely a real bug")
     score = min(100, 50 + min(hits, 120) // 3 + (15 if has_notes else 0))
     if hits >= 20:
-        return ("high", score)
+        return ("high", score,
+                f"symbolized frame {frame}, hit by {hits} inputs (>=20){notes_bit} — stable, reproducible, high-value")
     if hits >= 3 or has_notes:
-        return ("med", score)
-    return ("low", score)
+        return ("med", score,
+                f"symbolized frame {frame}, {hits} hit{plural}{notes_bit} — worth a look")
+    return ("low", score,
+            f"symbolized frame {frame} but only {hits} hit{plural} — may be hard to reproduce")
 
 
 def poc_preview(target, h, fname, max_hex_bytes=512):
@@ -682,7 +691,7 @@ def render_target(target):
     # Sort most-viable first so the high-value crashes float to the top of a
     # long list (the viab column/filter then lets you slice further).
     for c in crashes:
-        c['_viab'], c['_vscore'] = viability(c['top_frame'], c['hits'], c['has_notes'], c['status'])
+        c['_viab'], c['_vscore'], c['_vreason'] = viability(c['top_frame'], c['hits'], c['has_notes'], c['status'])
     crashes = sorted(crashes, key=lambda c: c['_vscore'], reverse=True)
 
     bucket = {}
@@ -693,7 +702,7 @@ def render_target(target):
         label, _hint = recommend_next_step(c['status'], c['hits'], c['has_notes'])
         cls = "done" if c['status'] in ('dup', 'ignore', 'reported') else \
               ("urgent" if "NOW" in label else "todo")
-        vbucket, vscore = c['_viab'], c['_vscore']
+        vbucket, vscore, vreason = c['_viab'], c['_vscore'], c['_vreason']
         crash_rows.append(
             f'<tr data-status="{html.escape(c["status"])}" data-frame="{html.escape(c["top_frame"].lower())}" '
             f'data-viab="{vbucket}" data-vscore="{vscore}">'
@@ -701,7 +710,7 @@ def render_target(target):
             f'<td>{render_status_tag(c["status"])}</td>'
             f'<td>{html.escape(c["top_frame"])}</td>'
             f'<td>{html.escape(c["hits"])}</td>'
-            f'<td><span class="tag viab-{vbucket}" title="viability score {vscore}/100">{vbucket}</span></td>'
+            f'<td><span class="tag viab-{vbucket}" title="{html.escape(vreason, quote=True)}">{vbucket} · {vscore}</span></td>'
             f'<td class="next {cls}">{html.escape(label)}</td>'
             f'<td class="muted">{html.escape(c["first_seen"])}</td>'
             f'</tr>'
@@ -874,6 +883,7 @@ def render_crash(target, h, flash=None):
     has_notes = notes is not None
 
     next_label, next_hint = recommend_next_step(status, hits, has_notes)
+    vbucket, vscore, vreason = viability(top_frame, hits, has_notes, status)
 
     meta_pretty = "(missing)"
     if meta_raw:
@@ -924,6 +934,7 @@ def render_crash(target, h, flash=None):
 <div class="kpis" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
   <div class="kpi"><div class="label">top frame</div><div class="value" style="font-size:1em;word-break:break-all">{html.escape(top_frame)}</div></div>
   <div class="kpi"><div class="label">hits</div><div class="value">{html.escape(hits)}</div></div>
+  <div class="kpi"><div class="label">viability</div><div class="value"><span class="tag viab-{vbucket}">{vbucket} · {vscore}</span></div><div class="sub">{html.escape(vreason)}</div></div>
   <div class="kpi"><div class="label">first seen</div><div class="value" style="font-size:0.95em">{html.escape(str(meta.get('first_seen', '?')))}</div></div>
   <div class="kpi {'warn' if 'NOW' in next_label else ''}"><div class="label">next step</div><div class="value" style="font-size:1.1em">{html.escape(next_label)}</div><div class="sub">{html.escape(next_hint)}</div></div>
 </div>
