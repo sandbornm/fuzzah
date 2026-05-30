@@ -320,21 +320,38 @@ def fmt_int(n):
     return str(n)
 
 
+# One python3 process walks every crash dir and emits the table — vs the old
+# shell loop that spawned ~3 python3 per crash (≈1600 processes for 500 crashes,
+# which is what made the crash list slow to (re)load).
+_CRASH_SCAN_PY = r'''
+import json, os, re
+pat = re.compile(r'^[0-9a-f]{12}$')
+for h in sorted(d for d in os.listdir('.') if pat.match(d) and os.path.isdir(d)):
+    status = 'new'
+    try:
+        with open(h + '/.status') as f:
+            status = f.read().strip() or 'new'
+    except OSError:
+        pass
+    tf = hits = first = '?'
+    try:
+        with open(h + '/meta.json') as f:
+            m = json.load(f)
+        tf = m.get('top_frame') or m.get('signature') or '?'
+        hits = m.get('hit_count', '?')
+        first = m.get('first_seen', '?')
+    except (OSError, ValueError):
+        pass
+    notes = 'Y' if os.path.exists(h + '/NOTES.md') else 'N'
+    print('%s|%s|%s|%s|%s|%s' % (h, status, tf, hits, first, notes))
+'''
+
+
 def target_crashes(target):
     """List entries under crashes-triaged/<hash>/. Returns list of dicts."""
     cmd = (
-        f'cd ~/fuzzing/targets/{shlex.quote(target)}/crashes-triaged 2>/dev/null && '
-        'for h in $(ls -1 | grep -E "^[0-9a-f]{12}$"); do '
-        '  meta="$h/meta.json"; status="new"; tf="?"; hits="?"; first="?"; '
-        '  [ -f "$h/.status" ] && status=$(tr -d "[:space:]" < "$h/.status"); '
-        '  if [ -f "$meta" ]; then '
-        '    tf=$(python3 -c "import json,sys; d=json.load(open(\\"$meta\\"));print(d.get(\\"top_frame\\") or d.get(\\"signature\\") or \\"?\\")" 2>/dev/null); '
-        '    hits=$(python3 -c "import json,sys; d=json.load(open(\\"$meta\\"));print(d.get(\\"hit_count\\", \\"?\\"))" 2>/dev/null); '
-        '    first=$(python3 -c "import json,sys; d=json.load(open(\\"$meta\\"));print(d.get(\\"first_seen\\", \\"?\\"))" 2>/dev/null); '
-        '  fi; '
-        '  notes="N"; [ -f "$h/NOTES.md" ] && notes="Y"; '
-        '  echo "$h|$status|$tf|$hits|$first|$notes"; '
-        'done'
+        f'cd ~/fuzzing/targets/{shlex.quote(target)}/crashes-triaged 2>/dev/null || exit 0\n'
+        "python3 - <<'PYEOF'\n" + _CRASH_SCAN_PY + "PYEOF\n"
     )
     out, _, _ = run_on_host(cmd, timeout=30)
     rows = []
@@ -460,6 +477,11 @@ form.statusform button.danger { color: #f85149; }
 .flash { background: #1f6f3a; color: #f0f6fc; padding: 0.5em 1em; border-radius: 4px; margin-bottom: 1em; }
 .flash.err { background: #6e2024; }
 details summary { cursor: pointer; padding: 0.3em 0; color: #58a6ff; }
+blockquote { border-left: 3px solid #30363d; margin: 0.6em 0; padding: 0.2em 1em; color: #8b949e; }
+.box ul, .box ol { margin: 0.5em 0; padding-left: 1.5em; }
+.box li { margin: 0.25em 0; }
+.box table { margin: 0.6em 0; }
+th[title], .kpi .label[title], .tag[title] { cursor: help; }
 """
 
 
@@ -561,19 +583,27 @@ def aggregate_kpis(health):
 def render_kpis(kpis, scope="global"):
     """Render KPI card row. scope='global' for index, 'target' for per-target."""
     live_cls = "live" if kpis["live_roles"] > 0 else "dead"
-    cal_html = f'<div class="kpi warn"><div class="label">calibrating</div><div class="value">{kpis["calibrating"]}</div><div class="sub">roles</div></div>' if kpis["calibrating"] else ""
+    t_live = "AFL++ workers whose fuzzer_pid is currently live (kill -0 verified, not just a stale stats file)."
+    t_cal = "Worker processes that are running but haven't written fuzzer_stats yet — usually finishes within 60-180s on ASAN+cmplog builds."
+    t_eps = "Sum of executions/sec across all live workers. A rough throughput gauge; below ~200/worker is worth investigating."
+    t_execs = "Total target executions since the rig started, summed across workers."
+    t_cov = "Best edge-coverage bitmap fill across workers — how much of the instrumented code has been reached."
+    t_corpus = "Total saved corpus inputs; favs = the high-value subset AFL fuzzes first, pending = not-yet-fuzzed queue entries."
+    t_crashes = "Crashes saved by AFL itself (per-worker count, before the triage loop dedupes them by ASAN stack hash)."
+    t_lf = "Time since ANY worker last found a new coverage path. Hours-long gaps mean the rig may have plateaued."
+    cal_html = f'<div class="kpi warn"><div class="label" title="{html.escape(t_cal, quote=True)}">calibrating</div><div class="value">{kpis["calibrating"]}</div><div class="sub">roles</div></div>' if kpis["calibrating"] else ""
     lf = kpis["min_last_find_s"]
     lf_html = fmt_age(lf) if lf is not None else "—"
     lf_cls = "warn" if (lf is not None and lf > 3600) else ""
     cards = [
-        f'<div class="kpi {live_cls}"><div class="label">live roles</div><div class="value">{kpis["live_roles"]}</div><div class="sub">across {kpis["targets"]} target{"s" if kpis["targets"] != 1 else ""}</div></div>',
+        f'<div class="kpi {live_cls}"><div class="label" title="{html.escape(t_live, quote=True)}">live roles</div><div class="value">{kpis["live_roles"]}</div><div class="sub">across {kpis["targets"]} target{"s" if kpis["targets"] != 1 else ""}</div></div>',
         cal_html,
-        f'<div class="kpi"><div class="label">execs/s</div><div class="value">{kpis["execs_per_sec"]:.0f}</div><div class="sub">aggregate</div></div>',
-        f'<div class="kpi"><div class="label">execs total</div><div class="value">{fmt_int(kpis["execs_done"])}</div><div class="sub">since rig start</div></div>',
-        f'<div class="kpi"><div class="label">coverage</div><div class="value">{kpis["max_cov"]:.1f}<span style="font-size:0.6em">%</span></div><div class="sub">best role bitmap</div></div>',
-        f'<div class="kpi"><div class="label">corpus</div><div class="value">{fmt_int(kpis["corpus_count"])}</div><div class="sub">{fmt_int(kpis["pending_favs"])} favs / {fmt_int(kpis["pending_total"])} pending</div></div>',
-        f'<div class="kpi"><div class="label">saved crashes</div><div class="value">{kpis["saved_crashes"]}</div><div class="sub">{kpis["saved_hangs"]} hangs</div></div>',
-        f'<div class="kpi {lf_cls}"><div class="label">last new path</div><div class="value">{lf_html}</div><div class="sub">across all roles</div></div>',
+        f'<div class="kpi"><div class="label" title="{html.escape(t_eps, quote=True)}">execs/s</div><div class="value">{kpis["execs_per_sec"]:.0f}</div><div class="sub">aggregate</div></div>',
+        f'<div class="kpi"><div class="label" title="{html.escape(t_execs, quote=True)}">execs total</div><div class="value">{fmt_int(kpis["execs_done"])}</div><div class="sub">since rig start</div></div>',
+        f'<div class="kpi"><div class="label" title="{html.escape(t_cov, quote=True)}">coverage</div><div class="value">{kpis["max_cov"]:.1f}<span style="font-size:0.6em">%</span></div><div class="sub">best role bitmap</div></div>',
+        f'<div class="kpi"><div class="label" title="{html.escape(t_corpus, quote=True)}">corpus</div><div class="value">{fmt_int(kpis["corpus_count"])}</div><div class="sub">{fmt_int(kpis["pending_favs"])} favs / {fmt_int(kpis["pending_total"])} pending</div></div>',
+        f'<div class="kpi"><div class="label" title="{html.escape(t_crashes, quote=True)}">saved crashes</div><div class="value">{kpis["saved_crashes"]}</div><div class="sub">{kpis["saved_hangs"]} hangs</div></div>',
+        f'<div class="kpi {lf_cls}"><div class="label" title="{html.escape(t_lf, quote=True)}">last new path</div><div class="value">{lf_html}</div><div class="sub">across all roles</div></div>',
     ]
     return f'<div class="kpis">{"".join(c for c in cards if c)}</div>'
 
@@ -634,7 +664,7 @@ def render_target(target):
     if not re.match(r'^[a-zA-Z0-9_-]+$', target):
         return page("err", "<p>bad target name</p>")
     roles = CACHE.get(f"roles:{target}", 10, lambda: target_roles(target))
-    crashes = CACHE.get(f"crashes:{target}", 30, lambda: target_crashes(target))
+    crashes = CACHE.get(f"crashes:{target}", 60, lambda: target_crashes(target))
     families = CACHE.get(f"families:{target}", 60, lambda: target_families(target))
 
     # Per-target KPIs from this target's roles
@@ -731,7 +761,18 @@ def render_target(target):
 {kpi_block}
 <h2>roles</h2>
 <table>
-<tr><th>role</th><th>state</th><th>execs/s</th><th>execs</th><th>cvg</th><th>corpus</th><th>pending</th><th>crashes</th><th>last find</th><th>stats age</th></tr>
+<tr>
+<th title="AFL++ worker. primary = fast build + CMPLOG; asan = ASAN/UBSAN build (traces); explore = broader power schedule.">role</th>
+<th title="alive = this worker's fuzzer_pid is live (kill -0). dead = stats file exists but the process is gone; the 5-min watchdog will relaunch it.">state</th>
+<th title="Executions per second right now. Below ~200 usually means calibration, a slow harness, or pathological inputs.">execs/s</th>
+<th title="Total target executions since this worker started.">execs</th>
+<th title="Edge-coverage bitmap fill — how much of the instrumented map this worker has reached.">cvg</th>
+<th title="Inputs kept in this worker's corpus (interesting/coverage-increasing test cases).">corpus</th>
+<th title="Queue entries not yet fuzzed: total, and favored (the smaller high-value subset AFL prioritizes).">pending</th>
+<th title="Unique crashes saved by this worker (AFL's own count, before cross-worker dedup).">crashes</th>
+<th title="Time since this worker last discovered a new coverage path. Long gaps (hours) suggest it has plateaued.">last find</th>
+<th title="Age of this worker's fuzzer_stats file. If it stops advancing, the worker has stalled or died.">stats age</th>
+</tr>
 {''.join(role_rows) or '<tr><td colspan=10 class="muted">no roles</td></tr>'}
 </table>
 {fam_html}
@@ -750,7 +791,15 @@ def render_target(target):
   &nbsp; <span class="muted" id="fcount">{len(crashes)} shown</span>
 </div>
 <table id="crashtab">
-<tr><th>hash</th><th>status</th><th>top frame</th><th>hits</th><th>viab</th><th>next step</th><th>first seen</th></tr>
+<tr>
+<th title="Short ID of this unique crash (its triaged dir name). Click to open the full crash view. [N] = a NOTES.md exists.">hash</th>
+<th title="Triage workflow state: new -> reviewed -> repro-ok -> reported. dup/ignore are parked. Set it on the crash page.">status</th>
+<th title="Top symbolized stack frame from the ASAN trace — the function where it crashed. 'no-frames' means it was never symbolized (usually a timeout/OOM-kill).">top frame</th>
+<th title="How many distinct fuzzer inputs landed on this same crash signature. Higher = more stable and reproducible.">hits</th>
+<th title="Triage-worthiness (bucket + 0-100 score) from symbolization and hit count. Hover a row's tag for the reason. high = symbolized + many hits.">viab</th>
+<th title="Suggested next action for this crash given its state, hit count, and whether it has NOTES.md.">next step</th>
+<th title="Timestamp the fuzzer first saved an input with this crash signature.">first seen</th>
+</tr>
 {''.join(crash_rows) or '<tr><td colspan=7 class="muted">no triaged crashes</td></tr>'}
 </table>
 <script>
@@ -783,8 +832,26 @@ MD_BOLD = re.compile(r'\*\*([^*]+)\*\*')
 MD_LINK = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
 
 
+MD_TABLE_SEP = re.compile(r'^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$')
+MD_ULI = re.compile(r'^\s*[-*]\s+')
+MD_OLI = re.compile(r'^\s*\d+\.\s+')
+# NB: the markdown is html-escaped before block parsing runs, so a '>' quote
+# marker has already become '&gt;' by the time we match here.
+MD_QUOTE = re.compile(r'^\s*&gt;\s?')
+
+
+def _split_table_row(s):
+    s = s.strip()
+    if s.startswith('|'):
+        s = s[1:]
+    if s.endswith('|'):
+        s = s[:-1]
+    return [c.strip() for c in s.split('|')]
+
+
 def md_to_html(md):
-    """Minimal markdown → HTML. Headers, code fences, inline code, bold, links."""
+    """Minimal markdown → HTML. Headers, code fences, inline code, bold, links,
+    unordered/ordered lists, GitHub-style pipe tables, and blockquotes."""
     if not md:
         return ""
     placeholders = {}
@@ -824,13 +891,65 @@ def md_to_html(md):
         return f"<h{n+1}>{m.group(2)}</h{n+1}>"
     md = MD_HEADERS.sub(hdr, md)
 
-    # blank-line paragraphs
+    # Block assembly. Headers + code blocks are already <...>/__PH placeholders;
+    # here we recognise lists, pipe tables, blockquotes, and paragraphs. Inline
+    # transforms (bold/code/links) already ran above, so cell/item text is ready.
+    lines = md.split('\n')
     blocks = []
-    for chunk in re.split(r'\n\n+', md):
-        if chunk.strip().startswith('<') or chunk.strip().startswith('__PH'):
-            blocks.append(chunk)
+    i, n = 0, len(lines)
+
+    def is_block_start(idx):
+        s = lines[idx].strip()
+        return (
+            not s or s.startswith('<') or s.startswith('__PH')
+            or MD_ULI.match(lines[idx]) or MD_OLI.match(lines[idx]) or MD_QUOTE.match(lines[idx])
+            or ('|' in lines[idx] and idx + 1 < n and MD_TABLE_SEP.match(lines[idx + 1]))
+        )
+
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped:
+            i += 1
+            continue
+        if stripped.startswith('<') or stripped.startswith('__PH'):
+            blocks.append(line)
+            i += 1
+        elif '|' in line and i + 1 < n and MD_TABLE_SEP.match(lines[i + 1]):
+            header = _split_table_row(line)
+            i += 2
+            body = []
+            while i < n and lines[i].strip() and '|' in lines[i]:
+                body.append(_split_table_row(lines[i]))
+                i += 1
+            thead = ''.join(f'<th>{c}</th>' for c in header)
+            tbody = ''.join('<tr>' + ''.join(f'<td>{c}</td>' for c in r) + '</tr>' for r in body)
+            blocks.append(f'<table><tr>{thead}</tr>{tbody}</table>')
+        elif MD_ULI.match(line):
+            items = []
+            while i < n and MD_ULI.match(lines[i]):
+                items.append(MD_ULI.sub('', lines[i]))
+                i += 1
+            blocks.append('<ul>' + ''.join(f'<li>{it}</li>' for it in items) + '</ul>')
+        elif MD_OLI.match(line):
+            items = []
+            while i < n and MD_OLI.match(lines[i]):
+                items.append(MD_OLI.sub('', lines[i]))
+                i += 1
+            blocks.append('<ol>' + ''.join(f'<li>{it}</li>' for it in items) + '</ol>')
+        elif MD_QUOTE.match(line):
+            quote = []
+            while i < n and MD_QUOTE.match(lines[i]):
+                quote.append(MD_QUOTE.sub('', lines[i]))
+                i += 1
+            blocks.append('<blockquote>' + '<br>'.join(quote) + '</blockquote>')
         else:
-            blocks.append('<p>' + chunk.replace('\n', '<br>') + '</p>')
+            para = [line]
+            i += 1
+            while i < n and not is_block_start(i):
+                para.append(lines[i])
+                i += 1
+            blocks.append('<p>' + '<br>'.join(para) + '</p>')
     out = '\n'.join(blocks)
 
     for k, v in placeholders.items():
