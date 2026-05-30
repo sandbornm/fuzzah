@@ -239,6 +239,35 @@ def recommend_next_step(status, hits_str, has_notes):
     return ("?", "")
 
 
+def viability(top_frame, hits_str, has_notes, status):
+    """Coarse triage-worthiness bucket → (bucket, score 0-100).
+
+    bucket ∈ high | med | low | noise | ignore. The signal is symbolization
+    plus hit count: an unsymbolized crash ("no-frames", "unknown-sig",
+    "Killed.") is almost always a timeout / OOM-kill — low value. A symbolized
+    top frame with a high hit count is a stable, reproducible candidate.
+    """
+    try:
+        hits = int(hits_str)
+    except (TypeError, ValueError):
+        hits = 0
+    if (status or "new") in ("dup", "ignore"):
+        return ("ignore", 0)
+    tf = (top_frame or "").lower()
+    symbolized = (
+        bool(tf) and tf != "?"
+        and "no-frames" not in tf and "unknown-sig" not in tf and "killed" not in tf
+    )
+    if not symbolized:
+        return ("noise", min(15, 5 + hits))
+    score = min(100, 50 + min(hits, 120) // 3 + (15 if has_notes else 0))
+    if hits >= 20:
+        return ("high", score)
+    if hits >= 3 or has_notes:
+        return ("med", score)
+    return ("low", score)
+
+
 def poc_preview(target, h, fname, max_hex_bytes=512):
     """Fetch first N bytes of a PoC + size + sha256. Returns dict or None."""
     path = f"~/fuzzing/targets/{target}/crashes-triaged/{h}/{fname}"
@@ -380,6 +409,11 @@ tr:hover td { background: #161b22; }
 .tag.repro-ok { background: #3fb950; color: black; }
 .tag.reported { background: #6e7681; color: white; }
 .tag.dup, .tag.ignore { background: #30363d; color: #6e7681; }
+.tag.viab-high { background: #3fb950; color: black; }
+.tag.viab-med { background: #d29922; color: black; }
+.tag.viab-low { background: #30363d; color: #c9d1d9; }
+.tag.viab-noise { background: #21262d; color: #6e7681; }
+.tag.viab-ignore { background: #161b22; color: #484f58; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; }
 .box { background: #161b22; border: 1px solid #30363d; border-radius: 4px; padding: 1em; }
 .refresh { font-size: 0.85em; color: #6e7681; }
@@ -644,7 +678,13 @@ def render_target(target):
             f"<td>{age_html}</td></tr>"
         )
 
-    # Crash list with next-step column + status buttons
+    # Crash list with viability + next-step columns + status buttons.
+    # Sort most-viable first so the high-value crashes float to the top of a
+    # long list (the viab column/filter then lets you slice further).
+    for c in crashes:
+        c['_viab'], c['_vscore'] = viability(c['top_frame'], c['hits'], c['has_notes'], c['status'])
+    crashes = sorted(crashes, key=lambda c: c['_vscore'], reverse=True)
+
     bucket = {}
     crash_rows = []
     for c in crashes:
@@ -653,12 +693,15 @@ def render_target(target):
         label, _hint = recommend_next_step(c['status'], c['hits'], c['has_notes'])
         cls = "done" if c['status'] in ('dup', 'ignore', 'reported') else \
               ("urgent" if "NOW" in label else "todo")
+        vbucket, vscore = c['_viab'], c['_vscore']
         crash_rows.append(
-            f'<tr data-status="{html.escape(c["status"])}" data-frame="{html.escape(c["top_frame"].lower())}">'
+            f'<tr data-status="{html.escape(c["status"])}" data-frame="{html.escape(c["top_frame"].lower())}" '
+            f'data-viab="{vbucket}" data-vscore="{vscore}">'
             f'<td><a href="/c/{html.escape(target)}/{html.escape(c["hash"])}">{html.escape(c["hash"])}</a>{notes_marker}</td>'
             f'<td>{render_status_tag(c["status"])}</td>'
             f'<td>{html.escape(c["top_frame"])}</td>'
             f'<td>{html.escape(c["hits"])}</td>'
+            f'<td><span class="tag viab-{vbucket}" title="viability score {vscore}/100">{vbucket}</span></td>'
             f'<td class="next {cls}">{html.escape(label)}</td>'
             f'<td class="muted">{html.escape(c["first_seen"])}</td>'
             f'</tr>'
@@ -691,22 +734,28 @@ def render_target(target):
     {' '.join(f'<option value="{s}">{s}</option>' for s in ('new','reviewed','repro-ok','reported','dup','ignore'))}
   </select>
   &nbsp; search frame: <input id="ffilter" oninput="filterCrashes()" placeholder="dblToCol, JBIG2…">
+  &nbsp; viability: <select id="fviab" onchange="filterCrashes()">
+    <option value="">all</option>
+    {' '.join(f'<option value="{v}">{v}</option>' for v in ('high','med','low','noise','ignore'))}
+  </select>
   &nbsp; <span class="muted" id="fcount">{len(crashes)} shown</span>
 </div>
 <table id="crashtab">
-<tr><th>hash</th><th>status</th><th>top frame</th><th>hits</th><th>next step</th><th>first seen</th></tr>
-{''.join(crash_rows) or '<tr><td colspan=6 class="muted">no triaged crashes</td></tr>'}
+<tr><th>hash</th><th>status</th><th>top frame</th><th>hits</th><th>viab</th><th>next step</th><th>first seen</th></tr>
+{''.join(crash_rows) or '<tr><td colspan=7 class="muted">no triaged crashes</td></tr>'}
 </table>
 <script>
 function filterCrashes() {{
   var s = document.getElementById('fstatus').value.toLowerCase();
   var q = document.getElementById('ffilter').value.toLowerCase();
+  var v = document.getElementById('fviab').value;
   var rows = document.querySelectorAll('#crashtab tr[data-status]');
   var shown = 0;
   rows.forEach(function(r) {{
     var sm = !s || r.dataset.status === s;
     var qm = !q || r.dataset.frame.indexOf(q) !== -1;
-    var on = sm && qm;
+    var vm = !v || r.dataset.viab === v;
+    var on = sm && qm && vm;
     r.style.display = on ? '' : 'none';
     if (on) shown++;
   }});
@@ -845,10 +894,17 @@ def render_crash(target, h, flash=None):
         size_str = f"{info['size']:,} B" if info['size'] is not None else "?"
         embed = ""
         if (info.get("size") or 0) < 1_500_000:
-            embed = (f'<details><summary>inline PDF view (Safari)</summary>'
-                     f'<object data="/poc/{html.escape(target)}/{html.escape(h)}/{which}" '
-                     f'type="application/pdf" width="100%" height="500">'
-                     f'<p class="muted">browser can\'t embed; <a href="/poc/{html.escape(target)}/{html.escape(h)}/{which}">download</a></p>'
+            pocurl = f'/poc/{html.escape(target)}/{html.escape(h)}/{which}'
+            # Lazy-load: these are malformed, parser-crashing PDFs. Handing one to
+            # the browser's PDF engine can hang it for many seconds, and an <object>
+            # with a live data= fetches+renders even inside a collapsed <details>.
+            # So we stash the URL in data-src and only wire up data= when the
+            # operator actually expands the panel.
+            embed = (f'<details ontoggle="if(this.open&&!this.dataset.loaded){{this.dataset.loaded=1;'
+                     f'var o=this.querySelector(\'object\');o.data=o.dataset.src;}}">'
+                     f'<summary>inline PDF view — loads on demand (crash input; may be slow or blank)</summary>'
+                     f'<object data-src="{pocurl}" type="application/pdf" width="100%" height="500">'
+                     f'<p class="muted">browser can\'t embed; <a href="{pocurl}">download</a></p>'
                      f'</object></details>')
         poc_blocks.append(f"""
 <h3>{html.escape(fname)}</h3>
