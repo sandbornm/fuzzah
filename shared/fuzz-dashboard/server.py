@@ -734,6 +734,8 @@ def render_target(target):
         c['_viab'], c['_vscore'], c['_vreason'] = viability(c['top_frame'], c['hits'], c['has_notes'], c['status'])
     crashes = sorted(crashes, key=lambda c: c['_vscore'], reverse=True)
 
+    reviewed_frames = frames_reviewed(crashes)
+
     bucket = {}
     crash_rows = []
     for c in crashes:
@@ -743,6 +745,18 @@ def render_target(target):
         cls = "done" if c['status'] in ('dup', 'ignore', 'reported') else \
               ("urgent" if "NOW" in label else "todo")
         vbucket, vscore, vreason = c['_viab'], c['_vscore'], c['_vreason']
+        if c['has_review']:
+            review_cell = '<span class="tag viab-high">reviewed</span>'
+        elif c['has_notes']:
+            review_cell = '<span class="muted">noted</span>'
+        elif c['top_frame'] in reviewed_frames:
+            review_cell = '<span class="muted">frame done</span>'
+        else:
+            review_cell = (
+                f'<form class="statusform" method="POST" action="/api/status/{html.escape(target)}/{html.escape(c["hash"])}">'
+                f'<input type="hidden" name="new_status" value="review-requested">'
+                f'<button type="submit" title="Queue agentic review for this frame.">review</button>'
+                f'</form>')
         crash_rows.append(
             f'<tr data-status="{html.escape(c["status"])}" data-frame="{html.escape(c["top_frame"].lower())}" '
             f'data-viab="{vbucket}" data-vscore="{vscore}">'
@@ -751,6 +765,7 @@ def render_target(target):
             f'<td>{html.escape(c["top_frame"])}</td>'
             f'<td>{html.escape(c["hits"])}</td>'
             f'<td><span class="tag viab-{vbucket}" title="{html.escape(vreason, quote=True)}">{vbucket} · {vscore}</span></td>'
+            f'<td>{review_cell}</td>'
             f'<td class="next {cls}">{html.escape(label)}</td>'
             f'<td class="muted">{html.escape(c["first_seen"])}</td>'
             f'</tr>'
@@ -807,10 +822,11 @@ def render_target(target):
 <th title="Top symbolized stack frame from the ASAN trace — the function where it crashed. 'no-frames' means it was never symbolized (usually a timeout/OOM-kill).">top frame</th>
 <th title="How many distinct fuzzer inputs landed on this same crash signature. Higher = more stable and reproducible.">hits</th>
 <th title="Triage-worthiness (bucket + 0-100 score) from symbolization and hit count. Hover a row's tag for the reason. high = symbolized + many hits.">viab</th>
+<th title="Request or see agentic review for this crash's frame. One review covers all crashes sharing a top frame.">review</th>
 <th title="Suggested next action for this crash given its state, hit count, and whether it has NOTES.md.">next step</th>
 <th title="Timestamp the fuzzer first saved an input with this crash signature.">first seen</th>
 </tr>
-{''.join(crash_rows) or '<tr><td colspan=7 class="muted">no triaged crashes</td></tr>'}
+{''.join(crash_rows) or '<tr><td colspan=8 class="muted">no triaged crashes</td></tr>'}
 </table>
 <script>
 function filterCrashes() {{

@@ -52,5 +52,14 @@ class FrontmatterTests(unittest.TestCase):
         self.assertEqual(body, "just text")
 
 
+class ListReviewTests(unittest.TestCase):
+    def test_unreviewed_unnoted_frame_is_actionable(self):
+        crashes = [{"top_frame": "x", "has_review": False, "has_notes": False}]
+        reviewed = server.frames_reviewed(crashes)
+        c = crashes[0]
+        actionable = (not c["has_notes"]) and (c["top_frame"] not in reviewed)
+        self.assertTrue(actionable)
+
+
 if __name__ == "__main__":
     unittest.main()
