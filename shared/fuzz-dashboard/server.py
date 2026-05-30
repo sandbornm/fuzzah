@@ -241,6 +241,11 @@ def recommend_next_step(status, hits_str, has_notes):
     return ("?", "")
 
 
+def frames_reviewed(crashes):
+    """Set of top_frames for which at least one crash already has a REVIEW.md."""
+    return {c['top_frame'] for c in crashes if c.get('has_review')}
+
+
 def viability(top_frame, hits_str, has_notes, status):
     """Coarse triage-worthiness → (bucket, score 0-100, reason).
 
@@ -345,7 +350,8 @@ for h in sorted(d for d in os.listdir('.') if pat.match(d) and os.path.isdir(d))
     except (OSError, ValueError):
         pass
     notes = 'Y' if os.path.exists(h + '/NOTES.md') else 'N'
-    print('%s|%s|%s|%s|%s|%s' % (h, status, tf, hits, first, notes))
+    review = 'Y' if os.path.exists(h + '/REVIEW.md') else 'N'
+    print('%s|%s|%s|%s|%s|%s|%s' % (h, status, tf, hits, first, notes, review))
 '''
 
 
@@ -358,10 +364,10 @@ def target_crashes(target):
     out, _, _ = run_on_host(cmd, timeout=30)
     rows = []
     for line in out.strip().splitlines():
-        parts = line.split('|', 5)
-        if len(parts) != 6:
+        parts = line.split('|', 6)
+        if len(parts) != 7:
             continue
-        h, status, tf, hits, first, notes = parts
+        h, status, tf, hits, first, notes, review = parts
         rows.append({
             'hash': h,
             'status': status or 'new',
@@ -369,6 +375,7 @@ def target_crashes(target):
             'hits': hits,
             'first_seen': first,
             'has_notes': notes == 'Y',
+            'has_review': review == 'Y',
         })
     return rows
 
