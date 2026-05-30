@@ -187,7 +187,7 @@ def target_roles(target):
     return roles
 
 
-VALID_STATES = {"new", "reviewed", "repro-ok", "reported", "dup", "ignore"}
+VALID_STATES = {"new", "review-requested", "reviewed", "repro-ok", "reported", "dup", "ignore"}
 
 
 def set_status_on_host(target, h, new_state):
@@ -236,6 +236,8 @@ def recommend_next_step(status, hits_str, has_notes):
         return ("done", "duplicate, no further action")
     if s == "ignore":
         return ("done", "noise / false positive")
+    if s == "review-requested":
+        return ("review queued", "run shared/fuzz-dashboard/review-drain.sh <target>")
     return ("?", "")
 
 
@@ -434,6 +436,7 @@ tr:hover td { background: #161b22; }
 .tag.reviewed { background: #d29922; color: black; }
 .tag.repro-ok { background: #3fb950; color: black; }
 .tag.reported { background: #6e7681; color: white; }
+.tag.review-requested { background: #8957e5; color: white; }
 .tag.dup, .tag.ignore { background: #30363d; color: #6e7681; }
 .tag.viab-high { background: #3fb950; color: black; }
 .tag.viab-med { background: #d29922; color: black; }
@@ -781,7 +784,7 @@ def render_target(target):
 <div class="filter-bar">
   filter status: <select id="fstatus" onchange="filterCrashes()">
     <option value="">all</option>
-    {' '.join(f'<option value="{s}">{s}</option>' for s in ('new','reviewed','repro-ok','reported','dup','ignore'))}
+    {' '.join(f'<option value="{s}">{s}</option>' for s in ('new','review-requested','reviewed','repro-ok','reported','dup','ignore'))}
   </select>
   &nbsp; search frame: <input id="ffilter" oninput="filterCrashes()" placeholder="dblToCol, JBIG2…">
   &nbsp; viability: <select id="fviab" onchange="filterCrashes()">
