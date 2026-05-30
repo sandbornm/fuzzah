@@ -7,6 +7,10 @@
 *.swp
 *~
 
+# Python (fuzz-dashboard server)
+__pycache__/
+*.pyc
+
 # Local overrides
 .claude/settings.local.json
 
