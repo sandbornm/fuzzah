@@ -859,6 +859,27 @@ def _split_table_row(s):
     return [c.strip() for c in s.split('|')]
 
 
+def parse_review_frontmatter(text):
+    """Split a leading `---`-delimited key: value frontmatter block from the body.
+    Returns (meta_dict_of_strings, body). No frontmatter -> ({}, text)."""
+    if not text or not text.startswith("---"):
+        return {}, text or ""
+    parts = text.split("\n")
+    if parts[0].strip() != "---":
+        return {}, text
+    meta, end = {}, None
+    for i in range(1, len(parts)):
+        if parts[i].strip() == "---":
+            end = i
+            break
+        if ":" in parts[i]:
+            k, v = parts[i].split(":", 1)
+            meta[k.strip()] = v.strip()
+    if end is None:
+        return {}, text
+    return meta, "\n".join(parts[end + 1:]).lstrip("\n")
+
+
 def md_to_html(md):
     """Minimal markdown → HTML. Headers, code fences, inline code, bold, links,
     unordered/ordered lists, GitHub-style pipe tables, and blockquotes."""
@@ -999,6 +1020,7 @@ def render_crash(target, h, flash=None):
     meta_raw = CACHE.get(f"meta:{target}:{h}", 60, lambda: read_vm_file(f"{base}/meta.json"))
     trace = CACHE.get(f"trace:{target}:{h}", 60, lambda: read_vm_file(f"{base}/trace.txt"))
     notes = CACHE.get(f"notes:{target}:{h}", 60, lambda: read_vm_file(f"{base}/NOTES.md"))
+    review_raw = CACHE.get(f"review:{target}:{h}", 60, lambda: read_vm_file(f"{base}/REVIEW.md"))
     status_raw = CACHE.get(f"status:{target}:{h}", 30, lambda: read_vm_file(f"{base}/.status"))
     status = (status_raw or "new").strip()
 
@@ -1022,6 +1044,25 @@ def render_crash(target, h, flash=None):
             meta_pretty = meta_raw
 
     notes_html = md_to_html(notes) if notes else '<p class="muted">no NOTES.md yet</p>'
+
+    if review_raw:
+        rmeta, rbody = parse_review_frontmatter(review_raw)
+        badge = ""
+        if rmeta.get("cost_usd") or rmeta.get("seconds"):
+            badge = (f' <span class="tag viab-high">reviewed · ${html.escape(rmeta.get("cost_usd","?"))}'
+                     f' · {html.escape(rmeta.get("seconds","?"))}s</span>')
+        review_section = f'<h2>automated review{badge}</h2><div class="box">{md_to_html(rbody)}</div>'
+        request_btn = ""
+    else:
+        review_section = ""
+        if not has_notes:
+            request_btn = (
+                f'<form class="statusform" method="POST" action="/api/status/{html.escape(target)}/{html.escape(h)}">'
+                f'<input type="hidden" name="new_status" value="review-requested">'
+                f'<button type="submit" title="Queue this crash for agentic review; run review-drain.sh to process the queue.">request review</button>'
+                f'</form>')
+        else:
+            request_btn = ""
 
     # PoC previews — both copies (original = AFL input, mut = current crash file)
     poc_blocks = []
@@ -1069,7 +1110,9 @@ def render_crash(target, h, flash=None):
 </div>
 
 <h2>change status</h2>
-<p>{render_status_form(target, h, status)}</p>
+<p>{render_status_form(target, h, status)} {request_btn}</p>
+
+{review_section}
 
 <h2>NOTES.md</h2>
 <div class="box">{notes_html}</div>

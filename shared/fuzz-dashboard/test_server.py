@@ -30,5 +30,27 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(server.frames_reviewed(crashes), {"dblToCol"})
 
 
+class FrontmatterTests(unittest.TestCase):
+    SAMPLE = ("---\n"
+              "reviewed_at: 2026-05-30T14:30:00-05:00\n"
+              "frame: dblToCol\n"
+              "model: claude-opus-4-8\n"
+              "cost_usd: 0.62\n"
+              "seconds: 48\n"
+              "---\n"
+              "# Review\n\nbody text\n")
+
+    def test_splits_frontmatter_and_body(self):
+        meta, body = server.parse_review_frontmatter(self.SAMPLE)
+        self.assertEqual(meta["frame"], "dblToCol")
+        self.assertEqual(meta["cost_usd"], "0.62")
+        self.assertTrue(body.lstrip().startswith("# Review"))
+
+    def test_no_frontmatter_returns_empty_meta(self):
+        meta, body = server.parse_review_frontmatter("just text")
+        self.assertEqual(meta, {})
+        self.assertEqual(body, "just text")
+
+
 if __name__ == "__main__":
     unittest.main()
