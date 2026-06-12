@@ -7,8 +7,7 @@ Dump the crash roster for the target.
 
 ```bash
 target="${TARGET:?target name required}"
-bash "$(git rev-parse --show-toplevel 2>/dev/null || echo .)/shared/run-on-fuzz-host.sh" \
-  "cat \"\$HOME/fuzzing/targets/${target}/crashes-triaged/INDEX.md\""
+bash "$(git rev-parse --show-toplevel 2>/dev/null || echo .)/shared/fuzz-crashes.sh" "$target"
 ```
 
 After the table, also report:

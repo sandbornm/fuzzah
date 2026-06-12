@@ -8,11 +8,11 @@ Run the target's `status.sh` and summarize.
 ```bash
 # The skill expects a target name in the invocation (e.g. $fuzz-status mytool).
 target="${TARGET:?target name required}"
-bash "$(git rev-parse --show-toplevel 2>/dev/null || echo .)/shared/run-on-fuzz-host.sh" \
-  "bash \"\$HOME/fuzzing/targets/${target}/scripts/status.sh\""
+bash "$(git rev-parse --show-toplevel 2>/dev/null || echo .)/shared/fuzz-status.sh" "$target"
 ```
 
-(`run-on-fuzz-host.sh` chooses direct Linux execution vs Orb automatically.)
+(`fuzz-status.sh` validates the target name, then uses `run-on-fuzz-host.sh`
+to choose direct Linux execution vs Orb automatically.)
 
 After running, call out anything unusual:
 

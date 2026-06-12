@@ -16,7 +16,7 @@ set -euo pipefail
 # sees them as intentionally reachable and so any grandchild process can
 # still read them without re-sourcing.
 export FUZZAH_SHARED_DIR FUZZAH_REPO_ROOT FUZZAH_TEMPLATE_ROOT FUZZAH_CONTROL_ROOT
-FUZZAH_SHARED_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FUZZAH_SHARED_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 FUZZAH_REPO_ROOT="$(cd "$FUZZAH_SHARED_DIR/.." && pwd)"
 FUZZAH_TEMPLATE_ROOT="$FUZZAH_REPO_ROOT/target-template"
 

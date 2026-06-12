@@ -73,6 +73,22 @@ for tdir in "$TARGETS_DIR"/*/; do
     execs="$(printf '%s' "$execs" | tr -cd '0-9')"
     execs="${execs:-0}"
   fi
+  if [[ "${execs:-0}" == "0" && -d "$tdir/findings" ]]; then
+    # Some dumb-mode targets synthesize minimal fuzzer_stats files for the
+    # dashboard even when afl-whatsup cannot infer a cumulative speed from the
+    # nonstandard output layout. Only count stats for live PIDs.
+    stats_execs=0
+    while IFS= read -r stats; do
+      pid="$(awk '/^fuzzer_pid/ {print $3; exit}' "$stats" 2>/dev/null)"
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        eps="$(awk '/^execs_per_sec/ {printf "%d", $3 + 0; exit}' "$stats" 2>/dev/null)"
+        stats_execs=$((stats_execs + ${eps:-0}))
+      fi
+    done < <(find "$tdir/findings" -maxdepth 2 -name "fuzzer_stats" 2>/dev/null)
+    if (( stats_execs > 0 )); then
+      execs="$stats_execs"
+    fi
+  fi
 
   triage_dir="$tdir/crashes-triaged"
   n_crashes=0; n_new=0; n_rev=0; n_repro=0; n_done=0

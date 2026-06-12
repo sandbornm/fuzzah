@@ -10,6 +10,7 @@ on the fuzz host itself.
 import argparse
 import html
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -24,6 +25,7 @@ THIS_FILE = Path(__file__).resolve()
 SHARED_DIR = THIS_FILE.parent.parent
 RUN_ON_HOST = SHARED_DIR / "run-on-fuzz-host.sh"
 CHECK_IN = SHARED_DIR / "check-in.sh"
+READ_ONLY = os.environ.get("FUZZ_DASHBOARD_READ_ONLY", "").lower() in {"1", "true", "yes", "on"}
 
 
 # ---------- VM-side data access ----------
@@ -268,15 +270,22 @@ def frames_reviewed(crashes):
     return {c['top_frame'] for c in crashes if c.get('has_review')}
 
 
-def viability(top_frame, hits_str, has_notes, status):
-    """Coarse triage-worthiness → (bucket, score 0-100, reason).
+def _maybe_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
-    bucket ∈ high | med | low | noise | ignore. The signal is symbolization
-    plus hit count: an unsymbolized crash ("no-frames", "unknown-sig",
-    "Killed.") is almost always a timeout / OOM-kill — low value. A symbolized
-    top frame with a high hit count is a stable, reproducible candidate.
-    `reason` is a short plain-English sentence, shown on hover, explaining the
-    bucket so the score is never a black box.
+
+def viability(top_frame, hits_str, has_notes, status, report_priority=None,
+              issue_class="", impact="", confidence="", assessed_severity=""):
+    """Coarse triage-worthiness/priority → (bucket, score 0-100, reason).
+
+    If a generated REPORT.md exists, its report_priority is authoritative. Raw
+    AFL hit count then remains a stability signal only; many inputs hitting the
+    same safe parser exception should not outrank a lower-hit but higher-impact
+    report. Targets without generated reports keep the legacy symbolization +
+    hit-count heuristic.
     """
     try:
         hits = int(hits_str)
@@ -285,6 +294,33 @@ def viability(top_frame, hits_str, has_notes, status):
     frame = top_frame or "?"
     if (status or "new") in ("dup", "ignore"):
         return ("ignore", 0, f"already marked '{status}' — out of the triage queue")
+    priority = _maybe_int(report_priority)
+    if priority is not None:
+        score = max(0, min(100, priority))
+        if score >= 75:
+            bucket = "high"
+        elif score >= 55:
+            bucket = "med"
+        elif score >= 30:
+            bucket = "low"
+        else:
+            bucket = "noise"
+        parts = []
+        if impact:
+            parts.append(str(impact))
+        if issue_class:
+            parts.append(str(issue_class))
+        if confidence:
+            parts.append(str(confidence))
+        if assessed_severity:
+            parts.append(f"severity={assessed_severity}")
+        detail = " / ".join(parts) if parts else "REPORT.md assessment"
+        return (
+            bucket,
+            score,
+            f"report priority {score}/100 from REPORT.md ({detail}); "
+            f"hits={hits} is stability only",
+        )
     tf = frame.lower()
     symbolized = (
         bool(tf) and tf != "?"
@@ -334,6 +370,30 @@ def poc_preview(target, h, fname, max_hex_bytes=512):
     return info
 
 
+POC_CANDIDATES = {
+    "original": [
+        ("poc.original.pdf", "application/pdf", "original AFL input"),
+        ("poc.original.bin", "application/octet-stream", "original AFL input"),
+    ],
+    "mut": [
+        ("poc.pdf", "application/pdf", "minimized/current PoC"),
+        ("poc.bin", "application/octet-stream", "minimized/current PoC"),
+    ],
+}
+
+
+def resolve_poc(target, h, which):
+    """Find the first crash artifact matching a logical PoC slot."""
+    if which not in POC_CANDIDATES:
+        return None
+    for fname, content_type, label in POC_CANDIDATES[which]:
+        path = f"~/fuzzing/targets/{target}/crashes-triaged/{h}/{fname}"
+        out, _, rc = run_on_host(f'test -f {vm_path(path)} && echo OK', timeout=8)
+        if rc == 0 and "OK" in out:
+            return {"fname": fname, "content_type": content_type, "label": label}
+    return None
+
+
 def fmt_int(n):
     """Human-friendly large number: 1234567 → 1.2M, 4500 → 4.5K."""
     try:
@@ -349,17 +409,45 @@ def fmt_int(n):
     return str(n)
 
 
+def normalize_status(text):
+    parts = (text or "").strip().split()
+    return parts[0] if parts else "new"
+
+
 # One python3 process walks every crash dir and emits the table — vs the old
 # shell loop that spawned ~3 python3 per crash (≈1600 processes for 500 crashes,
 # which is what made the crash list slow to (re)load).
 _CRASH_SCAN_PY = r'''
 import json, os, re
 pat = re.compile(r'^[0-9a-f]{12}$')
+
+def normalize_status(text):
+    parts = (text or '').strip().split()
+    return parts[0] if parts else 'new'
+
+def read_report_meta(path):
+    try:
+        with open(path, errors='replace') as f:
+            text = f.read()
+    except OSError:
+        return {}
+    if not text.startswith('---\n'):
+        return {}
+    out = {}
+    for line in text.splitlines()[1:]:
+        if line.strip() == '---':
+            return out
+        if ':' not in line:
+            continue
+        k, v = line.split(':', 1)
+        out[k.strip()] = v.strip()
+    return {}
+
 for h in sorted(d for d in os.listdir('.') if pat.match(d) and os.path.isdir(d)):
     status = 'new'
     try:
         with open(h + '/.status') as f:
-            status = f.read().strip() or 'new'
+            status = normalize_status(f.read())
     except OSError:
         pass
     tf = hits = first = '?'
@@ -371,9 +459,23 @@ for h in sorted(d for d in os.listdir('.') if pat.match(d) and os.path.isdir(d))
         first = m.get('first_seen', '?')
     except (OSError, ValueError):
         pass
+    report = read_report_meta(h + '/REPORT.md')
     notes = 'Y' if os.path.exists(h + '/NOTES.md') else 'N'
     review = 'Y' if os.path.exists(h + '/REVIEW.md') else 'N'
-    print('%s|%s|%s|%s|%s|%s|%s' % (h, status, tf, hits, first, notes, review))
+    print(json.dumps({
+        'hash': h,
+        'status': status,
+        'top_frame': tf,
+        'hits': hits,
+        'first_seen': first,
+        'has_notes': notes == 'Y',
+        'has_review': review == 'Y',
+        'issue_class': report.get('issue_class', ''),
+        'impact': report.get('impact', ''),
+        'confidence': report.get('confidence', ''),
+        'report_priority': report.get('report_priority', ''),
+        'assessed_severity': report.get('severity', ''),
+    }, sort_keys=True))
 '''
 
 
@@ -386,18 +488,43 @@ def target_crashes(target):
     out, _, _ = run_on_host(cmd, timeout=30)
     rows = []
     for line in out.strip().splitlines():
+        if line.startswith("{"):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            rows.append({
+                'hash': row.get('hash', ''),
+                'status': normalize_status(row.get('status')),
+                'top_frame': row.get('top_frame') or '?',
+                'hits': str(row.get('hits', '?')),
+                'first_seen': str(row.get('first_seen') or '?'),
+                'has_notes': bool(row.get('has_notes')),
+                'has_review': bool(row.get('has_review')),
+                'issue_class': row.get('issue_class') or '',
+                'impact': row.get('impact') or '',
+                'confidence': row.get('confidence') or '',
+                'report_priority': row.get('report_priority') or '',
+                'assessed_severity': row.get('assessed_severity') or '',
+            })
+            continue
         parts = line.split('|', 6)
         if len(parts) != 7:
             continue
         h, status, tf, hits, first, notes, review = parts
         rows.append({
             'hash': h,
-            'status': status or 'new',
+            'status': normalize_status(status),
             'top_frame': tf,
             'hits': hits,
             'first_seen': first,
             'has_notes': notes == 'Y',
             'has_review': review == 'Y',
+            'issue_class': '',
+            'impact': '',
+            'confidence': '',
+            'report_priority': '',
+            'assessed_severity': '',
         })
     return rows
 
@@ -749,11 +876,15 @@ def render_target(target):
             f"<td>{age_html}</td></tr>"
         )
 
-    # Crash list with viability + next-step columns + status buttons.
-    # Sort most-viable first so the high-value crashes float to the top of a
-    # long list (the viab column/filter then lets you slice further).
+    # Crash list with report-aware priority + next-step columns + status buttons.
+    # Sort highest-priority first so the high-value crashes float to the top of
+    # a long list (the priority column/filter then lets you slice further).
     for c in crashes:
-        c['_viab'], c['_vscore'], c['_vreason'] = viability(c['top_frame'], c['hits'], c['has_notes'], c['status'])
+        c['_viab'], c['_vscore'], c['_vreason'] = viability(
+            c['top_frame'], c['hits'], c['has_notes'], c['status'],
+            c.get('report_priority'), c.get('issue_class'), c.get('impact'),
+            c.get('confidence'), c.get('assessed_severity'),
+        )
     crashes = sorted(crashes, key=lambda c: c['_vscore'], reverse=True)
 
     reviewed_frames = frames_reviewed(crashes)
@@ -774,6 +905,8 @@ def render_target(target):
             review_cell = '<span class="muted">noted</span>'
         elif c['top_frame'] in reviewed_frames:
             review_cell = '<span class="muted">frame done</span>'
+        elif READ_ONLY:
+            review_cell = '<span class="muted">read-only</span>'
         else:
             review_cell = (
                 f'<form class="statusform" method="POST" action="/api/status/{html.escape(target)}/{html.escape(c["hash"])}">'
@@ -786,7 +919,7 @@ def render_target(target):
             f'<td><a href="/c/{html.escape(target)}/{html.escape(c["hash"])}">{html.escape(c["hash"])}</a>{notes_marker}</td>'
             f'<td>{render_status_tag(c["status"])}</td>'
             f'<td>{html.escape(c["top_frame"])}</td>'
-            f'<td>{html.escape(c["hits"])}</td>'
+            f'<td>{html.escape(str(c["hits"]))}</td>'
             f'<td><span class="tag viab-{vbucket}" title="{html.escape(vreason, quote=True)}">{vbucket} · {vscore}</span></td>'
             f'<td>{review_cell}</td>'
             f'<td class="next {cls}">{html.escape(label)}</td>'
@@ -832,7 +965,7 @@ def render_target(target):
     {' '.join(f'<option value="{s}">{s}</option>' for s in ('new','review-requested','reviewed','repro-ok','reported','dup','ignore'))}
   </select>
   &nbsp; search frame: <input id="ffilter" oninput="filterCrashes()" placeholder="dblToCol, JBIG2…">
-  &nbsp; viability: <select id="fviab" onchange="filterCrashes()">
+  &nbsp; priority: <select id="fviab" onchange="filterCrashes()">
     <option value="">all</option>
     {' '.join(f'<option value="{v}">{v}</option>' for v in ('high','med','low','noise','ignore'))}
   </select>
@@ -844,7 +977,7 @@ def render_target(target):
 <th title="Triage workflow state: new -> reviewed -> repro-ok -> reported. dup/ignore are parked. Set it on the crash page.">status</th>
 <th title="Top symbolized stack frame from the ASAN trace — the function where it crashed. 'no-frames' means it was never symbolized (usually a timeout/OOM-kill).">top frame</th>
 <th title="How many distinct fuzzer inputs landed on this same crash signature. Higher = more stable and reproducible.">hits</th>
-<th title="Triage-worthiness (bucket + 0-100 score) from symbolization and hit count. Hover a row's tag for the reason. high = symbolized + many hits.">viab</th>
+<th title="Report-aware priority bucket + 0-100 score. If REPORT.md has report_priority, hits are only a stability signal; otherwise this falls back to symbolization plus hit count.">priority</th>
 <th title="Request or see agentic review for this crash's frame. One review covers all crashes sharing a top frame.">review</th>
 <th title="Suggested next action for this crash given its state, hit count, and whether it has NOTES.md.">next step</th>
 <th title="Timestamp the fuzzer first saved an input with this crash signature.">first seen</th>
@@ -1039,6 +1172,8 @@ STATUS_BUTTONS = [
 
 
 def render_status_form(target, h, current):
+    if READ_ONLY:
+        return '<span class="muted">read-only dashboard; status changes disabled</span>'
     btns = []
     for state, label in STATUS_BUTTONS:
         if state == current:
@@ -1061,8 +1196,11 @@ def render_crash(target, h, flash=None):
     trace = CACHE.get(f"trace:{target}:{h}", 60, lambda: read_vm_file(f"{base}/trace.txt"))
     notes = CACHE.get(f"notes:{target}:{h}", 60, lambda: read_vm_file(f"{base}/NOTES.md"))
     review_raw = CACHE.get(f"review:{target}:{h}", 60, lambda: read_vm_file(f"{base}/REVIEW.md"))
+    report_raw = CACHE.get(f"report:{target}:{h}", 60, lambda: read_vm_file(f"{base}/REPORT.md"))
+    repro_raw = CACHE.get(f"repro:{target}:{h}", 60, lambda: read_vm_file(f"{base}/REPRO.md"))
+    poc_md_raw = CACHE.get(f"pocmd:{target}:{h}", 60, lambda: read_vm_file(f"{base}/POC.md"))
     status_raw = CACHE.get(f"status:{target}:{h}", 30, lambda: read_vm_file(f"{base}/.status"))
-    status = (status_raw or "new").strip()
+    status = normalize_status(status_raw)
 
     # Extract hits + top_frame from meta for the next-step recommendation
     meta = {}
@@ -1072,9 +1210,14 @@ def render_crash(target, h, flash=None):
     hits = str(meta.get("hit_count", "?"))
     top_frame = meta.get("top_frame") or meta.get("signature") or "?"
     has_notes = notes is not None
+    report_meta, report_body = parse_review_frontmatter(report_raw)
 
     next_label, next_hint = recommend_next_step(status, hits, has_notes)
-    vbucket, vscore, vreason = viability(top_frame, hits, has_notes, status)
+    vbucket, vscore, vreason = viability(
+        top_frame, hits, has_notes, status, report_meta.get("report_priority"),
+        report_meta.get("issue_class"), report_meta.get("impact"),
+        report_meta.get("confidence"), report_meta.get("severity"),
+    )
 
     meta_pretty = "(missing)"
     if meta_raw:
@@ -1084,6 +1227,9 @@ def render_crash(target, h, flash=None):
             meta_pretty = meta_raw
 
     notes_html = md_to_html(notes) if notes else '<p class="muted">no NOTES.md yet</p>'
+    report_html = md_to_html(report_body) if report_raw else '<p class="muted">no REPORT.md yet; run shared/crash-digest/promote-repros.py</p>'
+    repro_html = md_to_html(parse_review_frontmatter(repro_raw)[1]) if repro_raw else '<p class="muted">no REPRO.md yet</p>'
+    poc_md_html = md_to_html(parse_review_frontmatter(poc_md_raw)[1]) if poc_md_raw else '<p class="muted">no POC.md yet</p>'
 
     if review_raw:
         rmeta, rbody = parse_review_frontmatter(review_raw)
@@ -1095,7 +1241,9 @@ def render_crash(target, h, flash=None):
         request_btn = ""
     else:
         review_section = ""
-        if not has_notes:
+        if READ_ONLY:
+            request_btn = ""
+        elif not has_notes:
             request_btn = (
                 f'<form class="statusform" method="POST" action="/api/status/{html.escape(target)}/{html.escape(h)}">'
                 f'<input type="hidden" name="new_status" value="review-requested">'
@@ -1104,17 +1252,25 @@ def render_crash(target, h, flash=None):
         else:
             request_btn = ""
 
-    # PoC previews — both copies (original = AFL input, mut = current crash file)
+    # PoC previews — both logical copies. Poppler stores PDFs; byte-oriented
+    # targets store .bin inputs. Always show a hexdump, and only inline-render
+    # artifacts the browser can handle without corrupting the dashboard page.
     poc_blocks = []
-    for which, fname in [("original", "poc.original.pdf"), ("mut", "poc.pdf")]:
+    for which in ("original", "mut"):
+        resolved = resolve_poc(target, h, which)
+        if not resolved:
+            names = ", ".join(fname for fname, _, _ in POC_CANDIDATES[which])
+            poc_blocks.append(f'<details><summary>{html.escape(which)} PoC — not found ({html.escape(names)})</summary></details>')
+            continue
+        fname = resolved["fname"]
         info = poc_preview(target, h, fname)
         if not info:
             poc_blocks.append(f'<details><summary>{html.escape(fname)} — not found</summary></details>')
             continue
         size_str = f"{info['size']:,} B" if info['size'] is not None else "?"
         embed = ""
-        if (info.get("size") or 0) < 1_500_000:
-            pocurl = f'/poc/{html.escape(target)}/{html.escape(h)}/{which}'
+        pocurl = f'/poc/{html.escape(target)}/{html.escape(h)}/{which}'
+        if resolved["content_type"] == "application/pdf" and (info.get("size") or 0) < 1_500_000:
             # Lazy-load: these are malformed, parser-crashing PDFs. Handing one to
             # the browser's PDF engine can hang it for many seconds, and an <object>
             # with a live data= fetches+renders even inside a collapsed <details>.
@@ -1127,9 +1283,9 @@ def render_crash(target, h, flash=None):
                      f'<p class="muted">browser can\'t embed; <a href="{pocurl}">download</a></p>'
                      f'</object></details>')
         poc_blocks.append(f"""
-<h3>{html.escape(fname)}</h3>
+<h3>{html.escape(fname)} <span class="tag">{html.escape(resolved["label"])}</span></h3>
 <p><b>size:</b> {size_str} · <b>sha256:</b> <code>{html.escape(info.get('sha') or '?')}…</code> ·
-   <a href="/poc/{html.escape(target)}/{html.escape(h)}/{which}">download</a></p>
+   <a href="{pocurl}">download</a></p>
 <pre class="poc-hex">{html.escape(info.get('hexdump') or '')}</pre>
 {embed}""")
 
@@ -1144,7 +1300,7 @@ def render_crash(target, h, flash=None):
 <div class="kpis" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
   <div class="kpi"><div class="label">top frame</div><div class="value" style="font-size:1em;word-break:break-all">{html.escape(top_frame)}</div></div>
   <div class="kpi"><div class="label">hits</div><div class="value">{html.escape(hits)}</div></div>
-  <div class="kpi"><div class="label">viability</div><div class="value"><span class="tag viab-{vbucket}">{vbucket} · {vscore}</span></div><div class="sub">{html.escape(vreason)}</div></div>
+  <div class="kpi"><div class="label">priority</div><div class="value"><span class="tag viab-{vbucket}">{vbucket} · {vscore}</span></div><div class="sub">{html.escape(vreason)}</div></div>
   <div class="kpi"><div class="label">first seen</div><div class="value" style="font-size:0.95em">{html.escape(str(meta.get('first_seen', '?')))}</div></div>
   <div class="kpi {'warn' if 'NOW' in next_label else ''}"><div class="label">next step</div><div class="value" style="font-size:1.1em">{html.escape(next_label)}</div><div class="sub">{html.escape(next_hint)}</div></div>
 </div>
@@ -1153,6 +1309,15 @@ def render_crash(target, h, flash=None):
 <p>{render_status_form(target, h, status)} {request_btn}</p>
 
 {review_section}
+
+<h2>crash report</h2>
+<div class="box">{report_html}</div>
+
+<h2>PoC / reproducer code</h2>
+<div class="box">{poc_md_html}</div>
+
+<h2>repro output</h2>
+<div class="box">{repro_html}</div>
 
 <h2>NOTES.md</h2>
 <div class="box">{notes_html}</div>
@@ -1200,10 +1365,15 @@ def render_family(target, fam):
 def serve_poc(target, h, which):
     if not re.match(r'^[a-zA-Z0-9_-]+$', target) or not re.match(r'^[0-9a-f]{12}$', h):
         return None
-    fname = "poc.original.pdf" if which == "original" else "poc.pdf"
+    resolved = resolve_poc(target, h, which)
+    if not resolved:
+        return None
+    fname = resolved["fname"]
     path = f"~/fuzzing/targets/{target}/crashes-triaged/{h}/{fname}"
     data = read_vm_binary(path)
-    return data, fname
+    if data is None:
+        return None
+    return data, fname, resolved["content_type"]
 
 
 # ---------- HTTP plumbing ----------
@@ -1250,6 +1420,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(page("error", f"<h1>error</h1><pre>{html.escape(tb)}</pre>"), status=500)
 
     def route_post(self, path, form):
+        if READ_ONLY:
+            self._send(page("read-only", "<h1>read-only</h1><p>status changes are disabled on this dashboard.</p>"), status=403)
+            return
         m = re.match(r'^/api/status/([^/]+)/([^/]+)/?$', path)
         if m:
             target, h = m.group(1), m.group(2)
@@ -1290,8 +1463,8 @@ class Handler(BaseHTTPRequestHandler):
             result = serve_poc(m.group(1), m.group(2), m.group(3))
             if result is None or result[0] is None:
                 self._send("not found", "text/plain", 404); return
-            data, fname = result
-            self._send(data, "application/pdf", 200,
+            data, fname, content_type = result
+            self._send(data, content_type, 200,
                        extra_headers={"Content-Disposition": f'inline; filename="{fname}"'})
             return
         if path == "/invalidate":

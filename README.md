@@ -195,6 +195,20 @@ systemctl --user enable --now fuzz-watchdog.timer
 bash shared/rig-check.sh
 ```
 
+### About Apple container
+
+Apple's `container` project is relevant as a possible future Linux execution
+backend on Apple silicon, but it is not a replacement for this rig today.
+It runs Linux containers as lightweight VMs on macOS and consumes/produces
+OCI images. That makes it potentially useful for reproducible build/test
+environments or short-lived isolated fuzz jobs.
+
+It is **not** a way to fuzz macOS frameworks such as ImageIO inside a Darwin
+container. Those jobs need to run on the macOS host or a real macOS guest VM.
+For the existing AFL++ lane, keep OrbStack as the supported backend until
+there is a concrete reason to add a second Linux backend and maintain the
+extra host-routing surface.
+
 ### Sizing
 
 - **CPU:** 3 cores per target (fast + asan + explore). 10 cores fits 3
@@ -351,9 +365,9 @@ loads the trace, inspects source at the top frame, recommends action.
 ## See it in your browser — the fuhq dashboard
 
 `fuhq` is a live web view of the whole rig — fuzzer health, per-target stats,
-and per-crash drill-down with a **viability score** that tells you, at a glance,
-which crashes are worth your time. It's **Python stdlib only** — nothing to
-`pip install`.
+and per-crash drill-down with a **report-aware priority score** that tells you,
+at a glance, which crashes are worth your time. It's **Python stdlib only** —
+nothing to `pip install`.
 
 **1. Start it** on the host that can reach your fuzz host (the Mac, or the Linux
 box itself):
@@ -379,12 +393,50 @@ That's the whole setup. Three pages:
 | page | shows |
 |------|-------|
 | `/`                     | health banner, aggregate KPIs, target list |
-| `/t/<target>`           | per-worker stats + the crash table, filterable by status and **viability** (high / med / low / noise) |
-| `/c/<target>/<hash>`    | `NOTES.md`, trace, `meta.json`, PoC hexdump + download |
+| `/t/<target>`           | per-worker stats + the crash table, filterable by status and **priority** (high / med / low / noise) |
+| `/c/<target>/<hash>`    | `REPORT.md`, `POC.md`, `REPRO.md`, optional `REVIEW.md`, `NOTES.md`, trace, `meta.json`, PoC hexdump + download |
 
-The crash table sorts most-viable-first, so the handful of crashes that matter
-float to the top of a list that may be hundreds long. Hover any viability tag to
-see *why* it scored that way.
+The crash table sorts highest-priority-first, so the handful of crashes that
+matter float to the top of a list that may be hundreds long. When `REPORT.md`
+contains `report_priority`, that value drives the score and raw `hits` remain a
+separate stability signal. Hover any priority tag to see *why* it scored that
+way.
+
+### Six-hour crash digest
+
+`shared/crash-digest/` turns the dashboard into a phone-friendly email workflow.
+The scheduled entry point is:
+
+```sh
+bash shared/crash-digest/send-digest.sh
+```
+
+It runs a bounded raw-crash triage pass, promotes a small number of high-signal
+clusters into reproducible `REPORT.md`/`REPRO.md`/`POC.md` artifacts, collects
+live state, then sends a Resend email with direct dashboard links.
+
+Dry-run first:
+
+```sh
+bash shared/crash-digest/send-digest.sh --dry-run
+```
+
+Install on macOS with launchd jobs for both the dashboard and six-hour digest:
+
+```sh
+bash shared/crash-digest/install-macos.sh --dry-run
+bash shared/crash-digest/install-macos.sh --tailscale-serve
+```
+
+The email intentionally links to crash pages instead of attaching raw PoCs. This
+keeps mail delivery predictable and preserves the highest-fidelity view: summary,
+reproducer code, hexdump/download, trace, metadata, and status controls. The
+HTML email uses a light high-contrast palette because mobile mail clients often
+rewrite dark-mode colors.
+
+With `--tailscale-serve`, the dashboard is tailnet-only and read-only. It
+proxies to `127.0.0.1:8765` via Tailscale Serve; do not enable Tailscale Funnel
+for crash reports/PoCs.
 
 ---
 

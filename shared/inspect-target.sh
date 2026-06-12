@@ -26,6 +26,7 @@ SCRIPTS_DIR="$(fuzzah_scripts_dir "$TARGET")"
 
 strip_assignment() {
   local file="$1" key="$2"
+  [[ -f "$file" ]] || return 0
   awk -F= -v key="$key" '
     $1 == key {
       sub(/^[[:space:]]+/, "", $2)
@@ -48,6 +49,7 @@ normalize_value() {
 
 list_array_entries() {
   local file="$1" name="$2"
+  [[ -f "$file" ]] || return 0
   awk -v name="$name" '
     function flush_quotes(line) {
       while (match(line, /"[^"]+"/)) {
@@ -143,8 +145,12 @@ SRC_GIT_REF="$(normalize_value "$SRC_GIT_REF")"
 read_into_array SOURCES list_array_entries "$FETCH_SH" SOURCES
 read_into_array VALID_EXTENSIONS list_array_entries "$FILTER_SH" VALID_EXTENSIONS
 read_into_array VALID_MAGIC list_array_entries "$FILTER_SH" VALID_MAGIC_HEX
-# shellcheck disable=SC2016  # awk expression in single quotes is intentional
-read_into_array APT_PACKAGES awk 'NF && $1 !~ /^#/' "$APT_FILE"
+if [[ -f "$APT_FILE" ]]; then
+  # shellcheck disable=SC2016  # awk expression in single quotes is intentional
+  read_into_array APT_PACKAGES awk 'NF && $1 !~ /^#/' "$APT_FILE"
+else
+  read_into_array APT_PACKAGES true
+fi
 PLACEHOLDERS=()
 if [[ "${SRC_GIT_URL:-}" == *REPLACE_WITH* || "${SRC_GIT_URL:-}" == *REPLACE_ME* ]]; then
   PLACEHOLDERS+=("build-afl-fast.sh: SRC_GIT_URL still has a placeholder")

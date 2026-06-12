@@ -1,9 +1,9 @@
-# fuzzah (Fuzzing Assistant Harness) — AGENTS.md
+# fuzzah (Fuzzing Assistant Harness) - AGENTS.md
 
-> This file is the Codex-side counterpart to `CLAUDE.md`. Both describe the
-> same rig; the only differences are tool-specific invocation syntax
-> (`/check-in` in Claude Code ↔ `$check-in` in Codex). Keep this file and
-> `CLAUDE.md` in sync when the mental model changes.
+> Codex loads this file automatically. The Claude Code counterpart is
+> `CLAUDE.md` - keep both in sync when the mental model changes.
+> Codex skills use `$skill-name`; Claude Code has equivalent slash commands
+> (`/check-in`, etc.).
 >
 > First time here? Read `README.md` for the end-to-end walkthrough.
 
@@ -12,12 +12,11 @@
 ```
 ┌────────────── your host (Mac, Linux, or VM) ──────────────┐
 │ This repo:                                                 │
-│   AGENTS.md        (this file — Codex)                    │
-│   CLAUDE.md        (equivalent — Claude Code)             │
-│   .agents/skills/  (Codex-invokable skills: $name)        │
-│   .claude/         (Claude skills + slash commands)       │
-│   shared/          (cross-target infra scripts)           │
-│   target-template/ (per-target script pack to copy)       │
+│   AGENTS.md, CLAUDE.md    (tool-specific entry docs)       │
+│   .agents/skills/         (Codex entry points)             │
+│   .claude/{commands,skills,settings.json}                  │
+│   shared/                 (cross-target infra scripts)     │
+│   target-template/        (per-target script pack to copy) │
 │                                                            │
 │   ┌──── fuzzing host (this machine or an orb VM) ────┐    │
 │   │ $HOME/fuzzing/                                   │    │
@@ -42,32 +41,24 @@
 
 ## How things run
 
-- Everything lives under `$HOME/fuzzing/` inside the fuzzing host (your
-  Mac/Linux box directly, or an orb VM proxied via `orb -m <vm>`).
-- Shared infra (`shared/*.sh`) and per-target scripts (`~/fuzzing/targets/<t>/scripts/*.sh`)
-  run as the operator user, never as root (except for the specific `sudo`
-  calls in `harden.sh` and the occasional `dmesg`).
-- Each target runs **three** concurrent AFL++ workers under tmux:
-  `primary` (master), `asan` (secondary on sanitizer build), `explore`
-  (secondary with broader power schedule). Plus a `triage` loop and a
-  `status` tail.
-
-### Memory caps (critical)
-
-- `primary` + `explore` use `-m 1024` (1 GB RSS cap per child)
-- `asan` uses `-m none` (ASAN shadow memory needs unbounded virtual)
-- These values ship in `target-template/start-fuzz.sh`; don't blanket-change
-  without understanding why.
-
-A shared `fuzz-watchdog.timer` (user systemd, fires every 5 min) re-invokes
-every target's `start-fuzz.sh` — idempotent, only restarts roles that died
-(e.g. OOM). Logs at `~/fuzzing/logs/watchdog.log`.
-
-For fuzzer roles (`primary`, `asan`, `explore`), `start-fuzz.sh` does not log
-success immediately after sending commands to tmux. It waits for that role's
-`findings/<role>/fuzzer_stats`, reads `fuzzer_pid`, and verifies the process
-with `kill -0`; startup failure exits non-zero instead of reporting a false
-`[+] launched`.
+- Scripts can execute on the fuzzing host directly (Linux) or be proxied
+  via `orb -m <vm>` from a Mac. Use `shared/run-on-fuzz-host.sh` for commands
+  that must run on the fuzz host so `$HOME` expands on the right machine.
+- Shared infra (`shared/*.sh`) and per-target scripts
+  (`~/fuzzing/targets/<t>/scripts/*.sh`) run as the operator user, never as
+  root except for the specific `sudo` calls in `harden.sh` and diagnostics
+  such as `dmesg`.
+- Each target runs **three** concurrent AFL++ workers:
+  - `primary` - fast build + CMPLOG companion (`-m 1024`)
+  - `asan` - ASAN + UBSAN build (`-m none`)
+  - `explore` - fast build with broader power schedule (`-m 1024`)
+- Plus a `triage` loop and a `status` window per target, all in tmux.
+- A shared `fuzz-watchdog.timer` (user systemd, 5 min) re-invokes every
+  target's `start-fuzz.sh` - idempotent, only relaunches dead roles.
+- For fuzzer roles (`primary`, `asan`, `explore`), `start-fuzz.sh` waits for
+  `findings/<role>/fuzzer_stats`, reads `fuzzer_pid`, and verifies it with
+  `kill -0` before logging success. Startup failures exit non-zero instead of
+  printing an optimistic `[+] launched`.
 
 ## Skills (Codex)
 
@@ -80,6 +71,7 @@ Invoke as `$skill-name`:
 | `$fuzz-status`       | Single-target rig status                                               |
 | `$fuzz-crashes`      | List all unique triaged crashes for a target                           |
 | `$fuzz-review`       | Deep-dive one crash by hash — loads meta.json + trace.txt              |
+| `$fuzz-dashboard`    | Launch the fuhq browser dashboard                                      |
 | `$fuzz-crash-review` | The per-crash triage workflow (used by `$fuzz-review`)                 |
 | `$fuzz-add-target`   | Full pipeline to bring a new target online                             |
 
@@ -88,28 +80,34 @@ skills (`fuzz-crash-review`, `fuzz-add-target`) are symlinked from
 `.claude/skills/` so both tools share the same source of truth.
 
 Claude Code equivalents: `/check-in`, `/rig-check`, `/fuzz-status`,
-`/fuzz-crashes`, `/fuzz-review`.
+`/fuzz-crashes`, `/fuzz-review`, `/fuzz-dashboard`.
 
 ## Common ops
 
 ```sh
-# Cross-target dashboard (fuzz state)
-bash shared/check-in.sh
+# Cross-target fuzz-domain dashboard
+$check-in
 
-# System health (memory, OOM, systemd)
-bash shared/rig-check.sh
+# System-domain health (memory/OOM/systemd) - orthogonal to $check-in
+$rig-check
 
 # Status of one target's rig
-bash shared/run-on-fuzz-host.sh 'bash "$HOME/fuzzing/targets/<target>/scripts/status.sh"'
+$fuzz-status <target>
 
-# Triaged crash index for a target
-bash shared/run-on-fuzz-host.sh 'cat "$HOME/fuzzing/targets/<target>/crashes-triaged/INDEX.md"'
+# List all unique crashes for a target
+$fuzz-crashes <target>
 
-# Mark a crash (advance the workflow state)
+# Deep-dive review of a specific crash
+$fuzz-review <hash> <target>
+
+# Live browser dashboard (fuhq). Foreground server; Ctrl-C to stop.
+$fuzz-dashboard
+
+# Or ad-hoc, without a skill:
+bash shared/fuzz-status.sh <target>
+bash shared/fuzz-crashes.sh <target>
 bash shared/run-on-fuzz-host.sh \
   'echo reviewed > "$HOME/fuzzing/targets/<target>/crashes-triaged/<hash>/.status"'
-
-# Inspect a target setup before bootstrap
 bash shared/inspect-target.sh <target>
 ```
 
@@ -160,6 +158,57 @@ Helper scripts under `shared/` simplify the manual path:
 - `scaffold-target.sh <target>` — create `<control-root>/<target>-setup/`
 - `sync-target.sh <target>` — push that setup into `$HOME/fuzzing/targets/<target>/`
 - `bootstrap-target.sh <target>` — sync + build + cmin + systemd start
+
+## Where Codex-specific config lives
+
+- `.agents/skills/` - Codex skills for check-in, rig-check, status, crash
+  listing/review, dashboard launch, and target bootstrap.
+- `.agents/skills/fuzz-add-target` and `.agents/skills/fuzz-crash-review` are
+  symlinks to the Claude skill sources, so long-form workflows stay shared.
+- `AGENTS.md` - this file; Codex-facing operator model and entry points.
+- `shared/` - cross-target tooling used by both Codex and Claude.
+- `shared/fuzz-dashboard/` - fuhq browser dashboard (`run.sh`, `server.py`,
+  and review-drain helpers).
+- `shared/crash-digest/` - six-hour crash email pipeline: bounded raw triage,
+  deterministic repro/report promotion, JSON collection, and Resend delivery.
+
+## Crash digest automation
+
+`shared/crash-digest/send-digest.sh` is the stable entry point for scheduled
+email reports. It runs three VM-side stages through `shared/run-on-fuzz-host.sh`
+before sending from the control host:
+
+1. `triage-drain.sh` drains a capped number of unseen AFL crash files into
+   `crashes-triaged/`.
+2. `promote-repros.py` replays high-signal crashes and writes `REPORT.md`,
+   `REPRO.md`, and `POC.md`; reproducible crashes move to `.status=repro-ok`.
+3. `collect.py` emits the normalized snapshot used by the email renderer.
+
+The generated crash page is the source of truth for phone review:
+`/c/<target>/<hash>` renders `REPORT.md`, `POC.md`, `REPRO.md`, optional
+`REVIEW.md`, raw PoC hexdump/download, `trace.txt`, and `meta.json`.
+The dashboard's priority column uses `REPORT.md` `report_priority` when it
+exists; raw `hit_count` remains visible as stability/repro frequency only.
+
+`promote-repros.py` is deterministic and templates reports from observed replay
+facts. Richer LLM root-cause explanation belongs in `REVIEW.md`, generated by
+the separate `shared/fuzz-dashboard/review-drain.sh` flow for crashes marked
+`review-requested`.
+
+Mac install:
+
+```sh
+bash shared/crash-digest/install-macos.sh --dry-run
+bash shared/crash-digest/install-macos.sh --tailscale-serve
+```
+
+Private Resend/Tailscale config lives outside git, normally at
+`/Users/minimo/fuzzig/.secrets/fuzz-crash-digest.env`.
+
+With `--tailscale-serve`, the dashboard is served only inside the tailnet,
+proxies to `127.0.0.1:8765`, and the launchd dashboard runs
+`FUZZ_DASHBOARD_READ_ONLY=1` so email links can view reports/PoCs but cannot
+change workflow state. Do not enable Tailscale Funnel for crash reports.
 
 ## Cross-tool contract
 

@@ -42,11 +42,13 @@ python3 - <<'PY'
 import json, os, re
 best = {}        # frame -> (hits, hash)
 reviewed = set() # frames that already have a REVIEW.md
-for h in sorted(d for d in os.listdir('.') if re.fullmatch(r'[0-9a-f]{12}', d) and os.path.isdir(d)):
+def status_of(path):
     try:
-        st = open(h+'/.status').read().strip()
-    except OSError:
-        st = 'new'
+        return open(path).read().strip().split()[0]
+    except (OSError, IndexError):
+        return 'new'
+for h in sorted(d for d in os.listdir('.') if re.fullmatch(r'[0-9a-f]{12}', d) and os.path.isdir(d)):
+    st = status_of(h+'/.status')
     if st != 'review-requested':
         continue
     tf, hits = '?', 0
