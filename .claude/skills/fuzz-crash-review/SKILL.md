@@ -71,6 +71,29 @@ env ASAN_OPTIONS=symbolize=1:detect_leaks=0 \
 Check the target's `SETUP.md` or `start-fuzz.sh` for the exact binary path
 and harness invocation for that target.
 
+### macOS-host (jackalope) targets
+
+Some targets run on the macOS host instead of the Linux VM (engine=`jackalope`,
+e.g. `imageio`). They emit the **same `crashes-triaged/<hash>/` contract**, but
+on the Mac, not in the VM:
+
+- Crashes live at **`~/fuzzing-mac/targets/<target>/crashes-triaged/<hash>/`**
+  (no `orb`/VM wrapper — read them directly on the host).
+- **`trace.txt` is an lldb backtrace**, not the AFL lane's `=== ASAN output ===`
+  / `=== GDB backtrace ===` sections. Classify off `meta.json`'s `signature`
+  (the lldb stop reason, e.g. `EXC_BAD_ACCESS`) + `top_frame`, not ASan text.
+- Reproduce under guard pages (the harness is built without a sanitizer):
+  ```
+  DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib \
+    ~/fuzzing-mac/targets/<target>/harness/<harness-bin> \
+    ~/fuzzing-mac/targets/<target>/crashes-triaged/<hash>/poc.<ext>
+  ```
+- **ASan-class signatures won't appear** (ASan is broken on Tahoe / macOS 26).
+  Rely on **libgmalloc guard faults** plus the `signature` + `top_frame` for
+  classification. A silent OOB only faults under libgmalloc, so a "no-crash"
+  guard-ON replay can still be a real layout-sensitive bug — see the guard-off
+  follow-up in the target's `SETUP.md`.
+
 ## Tone
 
 Be decisive. "This is a heap-buffer-overflow in ParserX::readToken at line
