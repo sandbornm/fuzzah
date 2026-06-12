@@ -221,3 +221,40 @@ view. If you touch operator workflow:
 
 Target-specific docs live in `~/fuzzing/targets/<target>/SETUP.md` on the
 fuzzing host.
+
+## Working with git worktrees (concurrent agents)
+
+When more than one agent (e.g. Codex and Claude) may be working in this repo at
+once, do **not** `git checkout` / `switch` / `branch` inside the shared `fuzzah/`
+checkout — you'd yank the other agent's branch out from under them, and the
+running fuhq dashboard + the fuzzig symlinks (`shared/`, `.claude/*`, `.agents/`)
+all point at that one checkout. Use a **git worktree**: an isolated second
+checkout on its own branch that shares the same `.git`.
+
+**When to use one:**
+- Another agent is actively working in `fuzzah/` (the common case here).
+- You want to build/test a branch without disturbing the live checkout.
+
+**Setup — branch off the latest `main`:**
+```sh
+git -C /path/to/fuzzah fetch origin
+git -C /path/to/fuzzah worktree add -b feat/<name> \
+  /Users/minimo/fuzzig/.wt-<name> origin/main
+# then edit / test / commit inside /Users/minimo/fuzzig/.wt-<name>
+```
+
+**Caveats:**
+- The fuzzig `shared/`, `.claude/*`, `.agents/` symlinks resolve to the **main**
+  checkout, not your worktree — so your changes are **not live** for the rig
+  until the branch merges to `main`. Test using the worktree's own copies
+  (e.g. run `shared/fuzz-dashboard/server.py` from the worktree on a non-8765
+  port; run `shared/check-in.sh` from the worktree path).
+- Keep worktrees fuzzig-local (`/Users/minimo/fuzzig/.wt-*`), never inside
+  `fuzzah/`. Commit on the branch; do **not** `git push` without the operator's
+  ok.
+
+**Cleanup (after merge or abandon):**
+```sh
+git -C /path/to/fuzzah worktree remove /Users/minimo/fuzzig/.wt-<name>
+git -C /path/to/fuzzah branch -D feat/<name>   # only if abandoning unmerged
+```
