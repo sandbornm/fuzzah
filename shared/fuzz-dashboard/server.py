@@ -927,24 +927,234 @@ th[title], .kpi .label[title], .tag[title] { cursor: help; }
 """
 
 
-def page(title, body_html, refresh=None, crumbs=None):
-    refresh_meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ''
-    crumbs_html = ""
-    if crumbs:
-        crumbs_html = ' · '.join(crumbs)
-    refresh_note = f'<span class="refresh">auto-refresh {refresh}s</span>' if refresh else ''
+# Client-side poll cadence for the live (AJAX) pages. Tune here; the value is
+# injected verbatim into the page so JS and server agree.
+POLL_INTERVAL_MS = 10000
+
+
+def _shape_for_health(health):
+    """Opaque structure key for the index, stamped on <body data-shape>. When the
+    poller computes a different key from /api/state (host went un/reachable, a
+    target appeared/vanished, or the hero colour band changed) it does a one-off
+    full reload to re-render structure; otherwise it updates numbers in place."""
+    if not health.get("reachable"):
+        return "unreachable"
+    targets = sorted(health.get("targets") or [])
+    alive = health.get("total_alive", 0)
+    cal = health.get("total_calibrating", 0)
+    hero = "green" if alive > 0 else ("yellow" if cal > 0 else "red")
+    return "ok|" + hero + "|" + ",".join(targets)
+
+
+def _shape_for_target(target, roles):
+    """Structure key for a per-target page: target name + the set of role rows.
+    A role appearing/disappearing triggers a reload; alive/dead flips and number
+    changes are applied in place."""
+    return "t:" + target + "|" + ",".join(sorted(r["role"] for r in roles))
+
+
+# In-page poller. Stdlib-only on the server side; this is plain vanilla JS with
+# no deps. It fetches /api/state (or /api/state?target=<t>), then either reloads
+# (structural change, see _shape_for_*) or writes new values into the elements
+# the renderers instrument: KPI cards (data-kfield / data-subfield), the hero
+# counts (data-hero), index per-target rows (tr[data-target] > data-field), and
+# per-target role rows (tr[data-role] > data-rfield). On fetch error it keeps the
+# last-rendered values and flips the header indicator to a stale state.
+LIVE_JS = '''
+(function(){
+  var CFG = window.__FUHQ_LIVE__;
+  if(!CFG){ return; }
+  var POLL_MS = CFG.intervalMs || 10000;
+  var lastOk = null;      // ms epoch of last successful poll
+  var failing = false;
+  function ind(){ return document.getElementById('liveind'); }
+
+  function fmtInt(n){
+    n = Number(n);
+    if(!isFinite(n)) return String(n);
+    var a = Math.abs(n);
+    if(a>=1e9) return (n/1e9).toFixed(1)+'B';
+    if(a>=1e6) return (n/1e6).toFixed(1)+'M';
+    if(a>=1e3) return (n/1e3).toFixed(1)+'K';
+    return String(Math.trunc(n));
+  }
+  function fmtAge(s){
+    if(s===null||s===undefined) return '—';
+    s = Number(s);
+    if(s<0) return '?';
+    if(s<60) return s+'s';
+    if(s<3600) return Math.floor(s/60)+'m';
+    if(s<86400) return Math.floor(s/3600)+'h'+Math.floor((s%3600)/60)+'m';
+    return Math.floor(s/86400)+'d'+Math.floor((s%86400)/3600)+'h';
+  }
+  function fmtVal(v, fmt){
+    if(fmt==='int') return fmtInt(v);
+    if(fmt==='round') return (v===null||v===undefined)?'—':String(Math.round(Number(v)));
+    if(fmt==='cov') return (v===null||v===undefined)?'—':Number(v).toFixed(1);
+    if(fmt==='age') return fmtAge(v);
+    return (v===null||v===undefined)?'—':String(v);
+  }
+  function esc(name){ return (window.CSS && CSS.escape) ? CSS.escape(name) : name; }
+
+  function shapeOf(s){
+    if(!s.reachable) return 'unreachable';
+    if(s.roles){
+      var tn = (s.targets && s.targets[0]) ? s.targets[0].name : '';
+      return 't:'+tn+'|'+s.roles.map(function(r){return r.role;}).sort().join(',');
+    }
+    var names = (s.targets||[]).map(function(t){return t.name;}).sort().join(',');
+    var k = s.kpis||{};
+    var hero = (k.live_roles>0)?'green':((k.calibrating>0)?'yellow':'red');
+    return 'ok|'+hero+'|'+names;
+  }
+
+  function updateKpis(k){
+    if(!k) return;
+    document.querySelectorAll('[data-kfield]').forEach(function(el){
+      var f = el.dataset.kfield, fmt = el.dataset.fmt || 'raw';
+      if(!(f in k)) return;
+      el.textContent = fmtVal(k[f], fmt);
+    });
+    document.querySelectorAll('[data-subfield]').forEach(function(el){
+      var f = el.dataset.subfield, fmt = el.dataset.fmt || 'raw';
+      if(!(f in k)) return;
+      el.textContent = fmtVal(k[f], fmt);
+    });
+  }
+
+  function targetDot(t){
+    if(t.alive>0) return '<span class="live">●</span>';
+    if(t.calibrating>0 || t.proc>0) return '<span class="warn">●</span>';
+    return '<span class="dead">●</span>';
+  }
+  function targetStateText(t){
+    if(t.alive>0) return t.alive+'/'+t.proc+' alive · '+Math.round(t.execs_per_sec)+' execs/s';
+    if(t.calibrating>0) return t.calibrating+' calibrating';
+    if(t.proc>0) return t.proc+' proc, stale stats';
+    return 'idle';
+  }
+  function updateTargets(targets){
+    (targets||[]).forEach(function(t){
+      var row = document.querySelector('tr[data-target="'+esc(t.name)+'"]');
+      if(!row) return;
+      var d = row.querySelector('[data-field="dot"]'); if(d) d.innerHTML = targetDot(t);
+      var s = row.querySelector('[data-field="state"]'); if(s) s.textContent = targetStateText(t);
+      var c = row.querySelector('[data-field="crashes"]'); if(c) c.textContent = t.crashes;
+    });
+  }
+
+  function updateHero(s){
+    var k = s.kpis||{};
+    var crashes = (s.targets||[]).reduce(function(a,t){return a+(t.crashes||0);},0);
+    var map = {hero_alive:k.live_roles, hero_eps:Math.round(k.execs_per_sec||0),
+               hero_targets:(s.targets||[]).length, hero_cal:k.calibrating, hero_crashes:crashes};
+    document.querySelectorAll('[data-hero]').forEach(function(el){
+      var key = el.dataset.hero, v = map[key];
+      if(v!==undefined && v!==null) el.textContent = v;
+    });
+  }
+
+  function aliveHtml(alive){ return alive ? '<span class="live">●alive</span>' : '<span class="dead">●dead</span>'; }
+  function updateRoles(roles){
+    (roles||[]).forEach(function(r){
+      var row = document.querySelector('tr[data-role="'+esc(r.role)+'"]');
+      if(!row) return;
+      function cell(f){ return row.querySelector('[data-rfield="'+f+'"]'); }
+      var a = cell('alive'); if(a) a.innerHTML = aliveHtml(r.alive);
+      var ep = cell('execs_per_sec'); if(ep) ep.textContent = r.execs_per_sec;
+      var ed = cell('execs_done'); if(ed) ed.textContent = fmtInt(r.execs_done);
+      var cv = cell('bitmap_cvg'); if(cv) cv.textContent = String(r.bitmap_cvg||'0').replace('%','');
+      var cp = cell('corpus_count'); if(cp) cp.textContent = fmtInt(r.corpus_count);
+      var pd = cell('pending'); if(pd) pd.textContent = (r.pending_total||'')+' / fav '+(r.pending_favs||'');
+      var sc = cell('saved_crashes'); if(sc) sc.textContent = r.saved_crashes;
+      var lf = cell('last_find_age_s'); if(lf) lf.textContent = fmtAge(r.last_find_age_s);
+      var sa = cell('stats_age_s');
+      if(sa){ sa.textContent = fmtAge(r.stats_age_s); sa.classList.toggle('warn', Number(r.stats_age_s)>300); }
+    });
+  }
+
+  function apply(s){
+    if(shapeOf(s) !== (document.body.dataset.shape||'')){ location.reload(); return; }
+    updateKpis(s.kpis);
+    updateTargets(s.targets);
+    updateHero(s);
+    updateRoles(s.roles);
+  }
+
+  function tick(){
+    var e = ind();
+    if(!e) return;
+    var since = (lastOk===null) ? null : Math.round((Date.now()-lastOk)/1000);
+    if(failing){
+      e.textContent = 'stale · ' + (since===null?'?':since+'s') + ' ago';
+      e.classList.add('warn');
+    } else {
+      e.textContent = 'live · updated ' + (since===null?'now':(since+'s ago'));
+      e.classList.remove('warn');
+    }
+  }
+
+  function poll(){
+    fetch(CFG.url, {cache:'no-store'}).then(function(r){
+      if(!r.ok) throw new Error('http '+r.status);
+      return r.json();
+    }).then(function(s){
+      failing = false; lastOk = Date.now();
+      apply(s); tick();
+    }).catch(function(){
+      failing = true; tick();   // keep last values, mark stale
+    });
+  }
+
+  poll();
+  setInterval(poll, POLL_MS);
+  setInterval(tick, 1000);
+})();
+'''
+
+
+def page(title, body_html, refresh=None, crumbs=None, live=None, shape=None):
+    """Render a full HTML page.
+
+    live: when set (dict with 'url' and optional 'interval'), the page keeps
+    itself current via fetch(/api/state) instead of a full-page <meta refresh>.
+    The meta-refresh is then kept ONLY inside <noscript> as a no-JS fallback, and
+    `refresh` (seconds) drives just that fallback. `shape` is stamped on
+    <body data-shape> so the poller can detect a structural change and fall back
+    to a one-off reload. With live=None the legacy active meta-refresh behaviour
+    (driven by `refresh`) is preserved for non-live pages.
+    """
+    head_meta = ""
+    live_head = ""
+    body_attr = ""
+    refresh_note = ""
+    if live:
+        fallback = refresh or 15
+        head_meta = f'<noscript><meta http-equiv="refresh" content="{fallback}"></noscript>'
+        live_head = (
+            f'<script>window.__FUHQ_LIVE__={{url:{json.dumps(live["url"])},'
+            f'intervalMs:{int(live.get("interval", POLL_INTERVAL_MS))}}};</script>'
+            f'<script>{LIVE_JS}</script>'
+        )
+        body_attr = f' data-shape="{html.escape(shape or "", quote=True)}"'
+        refresh_note = '<span class="refresh" id="liveind">live</span>'
+    elif refresh:
+        head_meta = f'<meta http-equiv="refresh" content="{refresh}">'
+        refresh_note = f'<span class="refresh">auto-refresh {refresh}s</span>'
+    crumbs_html = ' · '.join(crumbs) if crumbs else ""
     return f"""<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
 <title>{html.escape(title)} — fuhq</title>
-{refresh_meta}
+{head_meta}
 <style>{CSS}</style>
-</head><body>
+</head><body{body_attr}>
 <div class="hdr">
   <div><a href="/">fuhq</a> <span class="crumbs">{crumbs_html}</span></div>
   <div>{refresh_note} <span class="muted">{html.escape(time.strftime('%Y-%m-%d %H:%M:%S'))}</span></div>
 </div>
 {body_html}
+{live_head}
 </body></html>"""
 
 
@@ -974,12 +1184,12 @@ def render_hero(health):
     n_tgt = len(health["targets"])
     if alive > 0:
         return f"""<div class="hero hero-green">
-  <h1><span class="dot live">●</span>{alive} role{'s' if alive != 1 else ''} alive · {eps:.0f} execs/s aggregate</h1>
+  <h1><span class="dot live">●</span><span data-hero="hero_alive">{alive}</span> role{'s' if alive != 1 else ''} alive · <span data-hero="hero_eps">{eps:.0f}</span> execs/s aggregate</h1>
   <div class="health-row">
-    <span><b>{n_tgt}</b> target{'s' if n_tgt != 1 else ''}</span>
-    <span><b>{alive}</b> alive</span>
-    {f'<span><b>{cal}</b> calibrating</span>' if cal else ''}
-    <span><b>{crashes}</b> unique crashes</span>
+    <span><b data-hero="hero_targets">{n_tgt}</b> target{'s' if n_tgt != 1 else ''}</span>
+    <span><b data-hero="hero_alive">{alive}</b> alive</span>
+    {f'<span><b data-hero="hero_cal">{cal}</b> calibrating</span>' if cal else ''}
+    <span><b data-hero="hero_crashes">{crashes}</b> unique crashes</span>
   </div>
 </div>"""
     if cal > 0:
@@ -1033,19 +1243,19 @@ def render_kpis(kpis, scope="global"):
     t_corpus = "Total saved corpus inputs; favs = the high-value subset AFL fuzzes first, pending = not-yet-fuzzed queue entries."
     t_crashes = "Crashes saved by AFL itself (per-worker count, before the triage loop dedupes them by ASAN stack hash)."
     t_lf = "Time since ANY worker last found a new coverage path. Hours-long gaps mean the rig may have plateaued."
-    cal_html = f'<div class="kpi warn"><div class="label" title="{html.escape(t_cal, quote=True)}">calibrating</div><div class="value">{kpis["calibrating"]}</div><div class="sub">roles</div></div>' if kpis["calibrating"] else ""
+    cal_html = f'<div class="kpi warn"><div class="label" title="{html.escape(t_cal, quote=True)}">calibrating</div><div class="value" data-kfield="calibrating" data-fmt="raw">{kpis["calibrating"]}</div><div class="sub">roles</div></div>' if kpis["calibrating"] else ""
     lf = kpis["min_last_find_s"]
     lf_html = fmt_age(lf) if lf is not None else "—"
     lf_cls = "warn" if (lf is not None and lf > 3600) else ""
     cards = [
-        f'<div class="kpi {live_cls}"><div class="label" title="{html.escape(t_live, quote=True)}">live roles</div><div class="value">{kpis["live_roles"]}</div><div class="sub">across {kpis["targets"]} target{"s" if kpis["targets"] != 1 else ""}</div></div>',
+        f'<div class="kpi {live_cls}"><div class="label" title="{html.escape(t_live, quote=True)}">live roles</div><div class="value" data-kfield="live_roles" data-fmt="raw">{kpis["live_roles"]}</div><div class="sub">across <span data-subfield="targets" data-fmt="raw">{kpis["targets"]}</span> target{"s" if kpis["targets"] != 1 else ""}</div></div>',
         cal_html,
-        f'<div class="kpi"><div class="label" title="{html.escape(t_eps, quote=True)}">execs/s</div><div class="value">{kpis["execs_per_sec"]:.0f}</div><div class="sub">aggregate</div></div>',
-        f'<div class="kpi"><div class="label" title="{html.escape(t_execs, quote=True)}">execs total</div><div class="value">{fmt_int(kpis["execs_done"])}</div><div class="sub">since rig start</div></div>',
-        f'<div class="kpi"><div class="label" title="{html.escape(t_cov, quote=True)}">coverage</div><div class="value">{kpis["max_cov"]:.1f}<span style="font-size:0.6em">%</span></div><div class="sub">best role bitmap</div></div>',
-        f'<div class="kpi"><div class="label" title="{html.escape(t_corpus, quote=True)}">corpus</div><div class="value">{fmt_int(kpis["corpus_count"])}</div><div class="sub">{fmt_int(kpis["pending_favs"])} favs / {fmt_int(kpis["pending_total"])} pending</div></div>',
-        f'<div class="kpi"><div class="label" title="{html.escape(t_crashes, quote=True)}">saved crashes</div><div class="value">{kpis["saved_crashes"]}</div><div class="sub">{kpis["saved_hangs"]} hangs</div></div>',
-        f'<div class="kpi {lf_cls}"><div class="label" title="{html.escape(t_lf, quote=True)}">last new path</div><div class="value">{lf_html}</div><div class="sub">across all roles</div></div>',
+        f'<div class="kpi"><div class="label" title="{html.escape(t_eps, quote=True)}">execs/s</div><div class="value" data-kfield="execs_per_sec" data-fmt="round">{kpis["execs_per_sec"]:.0f}</div><div class="sub">aggregate</div></div>',
+        f'<div class="kpi"><div class="label" title="{html.escape(t_execs, quote=True)}">execs total</div><div class="value" data-kfield="execs_done" data-fmt="int">{fmt_int(kpis["execs_done"])}</div><div class="sub">since rig start</div></div>',
+        f'<div class="kpi"><div class="label" title="{html.escape(t_cov, quote=True)}">coverage</div><div class="value"><span data-kfield="max_cov" data-fmt="cov">{kpis["max_cov"]:.1f}</span><span style="font-size:0.6em">%</span></div><div class="sub">best role bitmap</div></div>',
+        f'<div class="kpi"><div class="label" title="{html.escape(t_corpus, quote=True)}">corpus</div><div class="value" data-kfield="corpus_count" data-fmt="int">{fmt_int(kpis["corpus_count"])}</div><div class="sub"><span data-subfield="pending_favs" data-fmt="int">{fmt_int(kpis["pending_favs"])}</span> favs / <span data-subfield="pending_total" data-fmt="int">{fmt_int(kpis["pending_total"])}</span> pending</div></div>',
+        f'<div class="kpi"><div class="label" title="{html.escape(t_crashes, quote=True)}">saved crashes</div><div class="value" data-kfield="saved_crashes" data-fmt="raw">{kpis["saved_crashes"]}</div><div class="sub"><span data-subfield="saved_hangs" data-fmt="raw">{kpis["saved_hangs"]}</span> hangs</div></div>',
+        f'<div class="kpi {lf_cls}"><div class="label" title="{html.escape(t_lf, quote=True)}">last new path</div><div class="value" data-kfield="min_last_find_s" data-fmt="age">{lf_html}</div><div class="sub">across all roles</div></div>',
     ]
     return f'<div class="kpis">{"".join(c for c in cards if c)}</div>'
 
@@ -1053,9 +1263,13 @@ def render_kpis(kpis, scope="global"):
 def render_index():
     health = CACHE.get("health", 15, host_health)
     hero = render_hero(health)
+    live = {"url": "/api/state", "interval": POLL_INTERVAL_MS}
+    shape = _shape_for_health(health)
 
     if not health.get("reachable") or not health["targets"]:
-        return page("fuhq dashboard", hero, refresh=30)
+        # Still live: no KPI/target elements to patch, but the poller will reload
+        # once the host becomes reachable / a target appears (shape changes).
+        return page("fuhq dashboard", hero, refresh=30, live=live, shape=shape)
 
     kpis = aggregate_kpis(health)
     kpi_block = render_kpis(kpis, scope="global")
@@ -1072,10 +1286,11 @@ def render_index():
         else:
             dot, state = '<span class="dead">●</span>', "idle"
         target_rows.append(
-            f'<tr><td>{dot}</td>'
+            f'<tr data-target="{html.escape(t, quote=True)}">'
+            f'<td data-field="dot">{dot}</td>'
             f'<td><a href="/t/{html.escape(t)}/">{html.escape(t)}</a></td>'
-            f'<td>{state}</td>'
-            f'<td class="muted">{info["crashes"]} crashes</td></tr>'
+            f'<td data-field="state">{state}</td>'
+            f'<td class="muted"><span data-field="crashes">{info["crashes"]}</span> crashes</td></tr>'
         )
 
     check_in = CACHE.get("check_in", 15, fetch_check_in)
@@ -1087,7 +1302,7 @@ def render_index():
 <table>{''.join(target_rows)}</table>
 <details><summary>raw check-in output</summary><pre>{html.escape(check_in)}</pre></details>
 """
-    return page("fuhq dashboard", body, refresh=15)
+    return page("fuhq dashboard", body, refresh=15, live=live, shape=shape)
 
 
 def fmt_age(secs):
@@ -1147,16 +1362,16 @@ def render_target(target):
         lf_html = fmt_age(lf) if lf is not None else "—"
         cov = (r.get('bitmap_cvg') or '0').rstrip('%')
         role_rows.append(
-            f"<tr><td>{html.escape(r['role'])}</td>"
-            f"<td>{alive_html}</td>"
-            f"<td>{html.escape(r['execs_per_sec'])}</td>"
-            f"<td>{fmt_int(r.get('execs_done',0))}</td>"
-            f"<td>{html.escape(cov)}%</td>"
-            f"<td>{fmt_int(r.get('corpus_count',0))}</td>"
-            f"<td>{html.escape(r.get('pending_total',''))} / fav {html.escape(r.get('pending_favs',''))}</td>"
-            f"<td>{html.escape(r.get('saved_crashes',''))}</td>"
-            f"<td>{lf_html}</td>"
-            f"<td>{age_html}</td></tr>"
+            f"<tr data-role=\"{html.escape(r['role'], quote=True)}\"><td>{html.escape(r['role'])}</td>"
+            f"<td data-rfield=\"alive\">{alive_html}</td>"
+            f"<td data-rfield=\"execs_per_sec\">{html.escape(r['execs_per_sec'])}</td>"
+            f"<td data-rfield=\"execs_done\">{fmt_int(r.get('execs_done',0))}</td>"
+            f"<td><span data-rfield=\"bitmap_cvg\">{html.escape(cov)}</span>%</td>"
+            f"<td data-rfield=\"corpus_count\">{fmt_int(r.get('corpus_count',0))}</td>"
+            f"<td data-rfield=\"pending\">{html.escape(r.get('pending_total',''))} / fav {html.escape(r.get('pending_favs',''))}</td>"
+            f"<td data-rfield=\"saved_crashes\">{html.escape(r.get('saved_crashes',''))}</td>"
+            f"<td data-rfield=\"last_find_age_s\">{lf_html}</td>"
+            f"<td data-rfield=\"stats_age_s\">{age_html}</td></tr>"
         )
 
     # Crash list with report-aware priority + next-step columns + status buttons.
@@ -1292,7 +1507,9 @@ function filterCrashes() {{
 </script>
 """
     crumbs = [f'<a href="/t/{html.escape(target)}/">{html.escape(target)}</a>']
-    return page(target, body, refresh=15, crumbs=crumbs)
+    live = {"url": f"/api/state?target={target}", "interval": POLL_INTERVAL_MS}
+    return page(target, body, refresh=15, crumbs=crumbs, live=live,
+                shape=_shape_for_target(target, roles))
 
 
 MD_HEADERS = re.compile(r'^(#{1,6})\s+(.+)$', re.M)
@@ -1663,6 +1880,106 @@ def serve_poc(target, h, which):
     return data, fname, resolved["content_type"]
 
 
+# ---------- live JSON state (/api/state) ----------
+#
+# build_state() is the single data path behind the AJAX poller. It reuses the
+# SAME caches the HTML renderers use (CACHE "health" + "roles:<t>") and never
+# calls the heavy crashes-triaged scan, so a poll is no more expensive than a
+# page render — usually cheaper, since it returns only numbers. The shapes here
+# mirror what render_index/render_target already compute (aggregate_kpis and the
+# per-target roll-up), so the JSON is just those numbers without the HTML.
+
+def _target_public_row(target, health):
+    """One target's index-row numbers, JSON-serializable. Coverage/corpus are
+    summed/maxed from the cached roles (same math as the per-target page)."""
+    info = (health.get("by_target") or {}).get(target, {})
+    roles = CACHE.get(f"roles:{target}", 10, lambda: roles_for(target))
+    coverage = 0.0
+    corpus = 0
+    for r in roles:
+        try:
+            coverage = max(coverage, float((r.get("bitmap_cvg") or "0").rstrip('%')))
+        except (ValueError, TypeError):
+            pass
+        try:
+            corpus += int(r.get("corpus_count") or 0)
+        except (ValueError, TypeError):
+            pass
+    return {
+        "name": target,
+        "alive": info.get("alive", 0),
+        "calibrating": info.get("calibrating", 0),
+        "proc": info.get("proc", info.get("alive", 0)),
+        "execs_per_sec": round(float(info.get("execs_per_sec", 0.0)), 1),
+        "coverage": round(coverage, 1),
+        "corpus": corpus,
+        "crashes": info.get("crashes", 0),
+    }
+
+
+def build_state(target=None):
+    """Live snapshot for /api/state. target=None → global aggregate KPIs + every
+    target's row. target=<t> → that target's KPI roll-up, its row, and its raw
+    role list (for the per-target page). Pulls only from the health/roles caches."""
+    health = CACHE.get("health", 15, host_health)
+    state = {"ts": int(time.time()), "reachable": bool(health.get("reachable"))}
+    if not health.get("reachable"):
+        state["error"] = health.get("error", "")
+        state["kpis"] = {}
+        state["targets"] = []
+        return state
+
+    all_targets = health.get("targets") or []
+
+    if target is not None:
+        if not re.match(r'^[a-zA-Z0-9_-]+$', target) or target not in all_targets:
+            return {"ts": int(time.time()), "reachable": True,
+                    "error": "unknown target", "kpis": {}, "targets": []}
+        roles = CACHE.get(f"roles:{target}", 10, lambda: roles_for(target))
+
+        def acc(field):
+            s = 0
+            for r in roles:
+                try:
+                    s += int(r.get(field) or 0)
+                except (ValueError, TypeError):
+                    pass
+            return s
+
+        cov = 0.0
+        for r in roles:
+            try:
+                cov = max(cov, float((r.get("bitmap_cvg") or "0").rstrip('%')))
+            except (ValueError, TypeError):
+                pass
+        last_finds = [r["last_find_age_s"] for r in roles if r.get("last_find_age_s") is not None]
+        state["kpis"] = {
+            "live_roles": sum(1 for r in roles if r.get("alive")),
+            "calibrating": 0,
+            "targets": 1,
+            "execs_per_sec": round(sum(float(r.get("execs_per_sec") or 0)
+                                       for r in roles if r.get("alive")), 1),
+            "execs_done": acc("execs_done"),
+            "saved_crashes": acc("saved_crashes"),
+            "saved_hangs": acc("saved_hangs"),
+            "pending_total": acc("pending_total"),
+            "pending_favs": acc("pending_favs"),
+            "corpus_count": acc("corpus_count"),
+            "max_cov": round(cov, 1),
+            "min_last_find_s": min(last_finds) if last_finds else None,
+        }
+        state["targets"] = [_target_public_row(target, health)]
+        state["roles"] = roles
+        return state
+
+    kpis = aggregate_kpis(health)
+    kpis["execs_per_sec"] = round(float(kpis.get("execs_per_sec", 0.0)), 1)
+    kpis["max_cov"] = round(float(kpis.get("max_cov", 0.0)), 1)
+    state["kpis"] = kpis
+    state["targets"] = [_target_public_row(t, health) for t in all_targets]
+    return state
+
+
 # ---------- HTTP plumbing ----------
 
 class Handler(BaseHTTPRequestHandler):
@@ -1726,6 +2043,11 @@ class Handler(BaseHTTPRequestHandler):
     def route(self, path, query=""):
         if path in ("/", "/index", "/index.html"):
             self._send(render_index()); return
+        if path == "/api/state":
+            from urllib.parse import parse_qs
+            target = parse_qs(query).get("target", [None])[0]
+            payload = build_state(target)
+            self._send(json.dumps(payload), "application/json; charset=utf-8"); return
         m = re.match(r'^/t/([^/]+)/?$', path)
         if m: self._send(render_target(m.group(1))); return
         m = re.match(r'^/c/([^/]+)/([^/]+)/?$', path)

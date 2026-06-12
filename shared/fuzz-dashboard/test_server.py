@@ -198,5 +198,107 @@ class JackalopeRolesTests(unittest.TestCase):
         self.assertEqual(server.jackalope_roles_from_stats(badp), [])
 
 
+class StateEndpointTests(unittest.TestCase):
+    """build_state() is the data path behind /api/state. We synthesize a
+    reachable host + roles (no VM/orb), then assert the JSON shape the poller
+    consumes. host_health and roles_for are looked up as module globals inside
+    build_state/aggregate_kpis, so monkeypatching them on the module works."""
+
+    def _role(self, **kw):
+        base = {
+            "role": "primary", "alive": True, "stats_age_s": 5,
+            "execs_per_sec": "280", "execs_done": "100000", "last_find": "0",
+            "pending_total": "10", "pending_favs": "2", "unique_crashes": "4",
+            "saved_crashes": "4", "saved_hangs": "0", "corpus_count": "316",
+            "bitmap_cvg": "23.4%", "last_find_age_s": 30,
+        }
+        base.update(kw)
+        return base
+
+    def setUp(self):
+        self._h, self._r = server.host_health, server.roles_for
+        server.CACHE.invalidate()
+        self.roles = {
+            "imageio": [self._role(role="jackalope", last_find_age_s=10,
+                                   bitmap_cvg="23874", corpus_count="316",
+                                   saved_crashes="4", unique_crashes="4")],
+            "poppler": [self._role(role="primary", saved_crashes="3", unique_crashes="7",
+                                   corpus_count="900", bitmap_cvg="41.2%", last_find_age_s=300),
+                        self._role(role="asan", alive=True, saved_crashes="4", unique_crashes="7",
+                                   corpus_count="120", bitmap_cvg="38.0%", last_find_age_s=120)],
+        }
+        self.health = {
+            "reachable": True,
+            "targets": ["imageio", "poppler"],
+            "by_target": {
+                "imageio": {"alive": 1, "calibrating": 0, "proc": 1,
+                            "execs_per_sec": 280.0, "crashes": 4, "roles_seen": 1},
+                "poppler": {"alive": 2, "calibrating": 1, "proc": 3,
+                            "execs_per_sec": 900.0, "crashes": 7, "roles_seen": 2},
+            },
+            "total_alive": 3, "total_calibrating": 1,
+            "total_execs_per_sec": 1180.0, "total_crashes": 11,
+        }
+        server.host_health = lambda: self.health
+        server.roles_for = lambda t: self.roles.get(t, [])
+
+    def tearDown(self):
+        server.host_health, server.roles_for = self._h, self._r
+        server.CACHE.invalidate()
+
+    def test_global_state_shape(self):
+        s = server.build_state()
+        self.assertTrue(s["reachable"])
+        self.assertIn("ts", s)
+        k = s["kpis"]
+        for key in ("live_roles", "calibrating", "execs_per_sec", "execs_done",
+                    "max_cov", "corpus_count", "saved_crashes", "min_last_find_s"):
+            self.assertIn(key, k)
+        self.assertEqual(k["live_roles"], 3)
+        self.assertEqual(k["calibrating"], 1)
+        self.assertEqual(k["min_last_find_s"], 10)
+        # round-trips through json
+        self.assertIsInstance(json.loads(json.dumps(s)), dict)
+
+    def test_global_targets_rows(self):
+        s = server.build_state()
+        names = {t["name"] for t in s["targets"]}
+        self.assertEqual(names, {"imageio", "poppler"})
+        for t in s["targets"]:
+            for key in ("name", "alive", "execs_per_sec", "coverage",
+                        "corpus", "crashes", "calibrating", "proc"):
+                self.assertIn(key, t)
+        img = next(t for t in s["targets"] if t["name"] == "imageio")
+        self.assertEqual(img["alive"], 1)
+        self.assertEqual(img["crashes"], 4)
+        self.assertEqual(img["corpus"], 316)
+        self.assertEqual(img["coverage"], 23874.0)
+
+    def test_target_scoped_state(self):
+        s = server.build_state("poppler")
+        self.assertTrue(s["reachable"])
+        self.assertIn("roles", s)
+        self.assertEqual(len(s["roles"]), 2)
+        self.assertEqual(len(s["targets"]), 1)
+        self.assertEqual(s["targets"][0]["name"], "poppler")
+        self.assertEqual(s["kpis"]["live_roles"], 2)
+        # saved_crashes summed across this target's roles (3 + 4)
+        self.assertEqual(s["kpis"]["saved_crashes"], 7)
+        self.assertIsInstance(json.loads(json.dumps(s)), dict)
+
+    def test_unknown_target_is_safe(self):
+        self.assertEqual(server.build_state("nope")["error"], "unknown target")
+        # path-injection style target is rejected before any fs/VM access
+        self.assertEqual(server.build_state("../etc")["targets"], [])
+
+    def test_unreachable_host(self):
+        server.host_health = lambda: {"reachable": False, "error": "orb down"}
+        server.CACHE.invalidate()
+        s = server.build_state()
+        self.assertFalse(s["reachable"])
+        self.assertEqual(s["error"], "orb down")
+        self.assertEqual(s["targets"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
