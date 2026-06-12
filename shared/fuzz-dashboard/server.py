@@ -27,6 +27,14 @@ RUN_ON_HOST = SHARED_DIR / "run-on-fuzz-host.sh"
 CHECK_IN = SHARED_DIR / "check-in.sh"
 READ_ONLY = os.environ.get("FUZZ_DASHBOARD_READ_ONLY", "").lower() in {"1", "true", "yes", "on"}
 
+# macOS-host (jackalope/TinyInst) targets live on the LOCAL fs, not the VM. They
+# expose a normalized findings/stats.json instead of AFL's fuzzer_stats and are
+# reached without orb. Everything keyed on this root is the additive host-target
+# lane; VM (afl) targets are untouched.
+HOST_TARGETS_ROOT = Path(
+    os.environ.get("FUZZAH_HOST_TARGETS_ROOT", os.path.expanduser("~/fuzzing-mac/targets"))
+)
+
 
 # ---------- VM-side data access ----------
 
@@ -160,6 +168,24 @@ def host_health():
         }
         summary["total_alive"] += alive
         summary["total_calibrating"] += calibrating
+        summary["total_execs_per_sec"] += eps
+        summary["total_crashes"] += crashes
+
+    # ADDITIVE: append macOS-host (jackalope) targets. Local fs, no VM round-trip.
+    # The VM target data above is untouched; these only extend the summary.
+    for t in list_host_targets():
+        if t in summary["by_target"]:
+            continue
+        roles = roles_for(t)
+        alive = sum(1 for r in roles if r['alive'])
+        eps = sum(float(r['execs_per_sec'] or 0) for r in roles if r['alive'])
+        crashes = max((int(r['unique_crashes']) for r in roles if r['unique_crashes'].isdigit()), default=0)
+        summary["by_target"][t] = {
+            "alive": alive, "calibrating": 0, "proc": alive,
+            "execs_per_sec": eps, "crashes": crashes, "roles_seen": len(roles),
+        }
+        summary["targets"].append(t)
+        summary["total_alive"] += alive
         summary["total_execs_per_sec"] += eps
         summary["total_crashes"] += crashes
     return summary
@@ -486,8 +512,15 @@ def target_crashes(target):
         "python3 - <<'PYEOF'\n" + _CRASH_SCAN_PY + "PYEOF\n"
     )
     out, _, _ = run_on_host(cmd, timeout=30)
+    return _rows_from_scan_output(out)
+
+
+def _rows_from_scan_output(out):
+    """Parse the _CRASH_SCAN_PY emitter output (JSON lines, or the legacy
+    pipe-delimited form) into normalized crash row dicts. Shared by the VM
+    (run_on_host) and macOS-host (local subprocess) crash scans."""
     rows = []
-    for line in out.strip().splitlines():
+    for line in (out or "").strip().splitlines():
         if line.startswith("{"):
             try:
                 row = json.loads(line)
@@ -556,6 +589,256 @@ def read_vm_binary(path, max_bytes=10_000_000):
         return base64.b64decode(out)
     except Exception:
         return None
+
+
+# ---------- macOS-host (jackalope) data access — ADDITIVE ----------
+#
+# Host targets are read from the local fs (~/fuzzing-mac/targets/<t>/) with no
+# orb round-trip. The dispatchers below pick host vs VM behavior per target so
+# the rest of the dashboard renders both kinds uniformly. VM (afl) code paths
+# are unchanged.
+
+def _list_host_targets():
+    out = []
+    try:
+        for child in sorted(HOST_TARGETS_ROOT.iterdir()):
+            if child.name.startswith('_'):
+                continue
+            if child.is_dir() and (child / "engine").is_file():
+                out.append(child.name)
+    except (OSError, FileNotFoundError):
+        return []
+    return out
+
+
+def list_host_targets():
+    """macOS-host targets: local dirs under HOST_TARGETS_ROOT with an engine file."""
+    return CACHE.get("host_targets", 15, _list_host_targets)
+
+
+def is_host_target(target):
+    return target in list_host_targets()
+
+
+def jackalope_roles_from_stats(stats_path):
+    """Parse a jackalope findings/stats.json into the AFL-shaped role list the
+    dashboard renders. Returns a single synthetic 'jackalope' role (the engine
+    is single-process from the dashboard's POV), with the same keys target_roles
+    emits for AFL; fields with no jackalope analogue are "0"/"—". Returns [] if
+    the stats file is missing or unparseable."""
+    try:
+        with open(stats_path) as f:
+            s = json.load(f)
+    except (OSError, ValueError):
+        return []
+
+    def _i(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    now = int(time.time())
+    alive = bool(s.get("alive"))
+    execs_done = _i(s.get("execs_done"))
+    eps = _i(s.get("execs_per_sec"))
+    corpus = _i(s.get("corpus_count"))
+    coverage = _i(s.get("coverage"))      # offsets reached (maps to bitmap_cvg)
+    saved = _i(s.get("saved_crashes"))
+    last_find = _i(s.get("last_find"))
+    start_time = _i(s.get("start_time"))
+    updated = _i(s.get("updated_at"))
+    pid = str(s.get("pid") or "")
+
+    role = {
+        "role": "jackalope",
+        "alive": alive,
+        "stats_age_s": max(0, now - updated) if updated else -1,
+        "fuzzer_pid": pid,
+        "pid": pid,
+        "execs_per_sec": str(eps),
+        "execs_done": str(execs_done),
+        "last_find": str(last_find),
+        "pending_total": "0",
+        "pending_favs": "0",
+        "unique_crashes": str(saved),
+        "saved_crashes": str(saved),
+        "saved_hangs": "0",
+        "corpus_count": str(corpus),
+        "bitmap_cvg": str(coverage),
+        "stability": "—",
+        "cycles_done": "0",
+        "cycles_wo_finds": "0",
+        "start_time": str(start_time),
+        "last_find_age_s": max(0, now - last_find) if last_find else None,
+    }
+    return [role]
+
+
+def host_target_roles(target):
+    stats_path = HOST_TARGETS_ROOT / target / "findings" / "stats.json"
+    return jackalope_roles_from_stats(str(stats_path))
+
+
+def host_crash_dir(target, h):
+    return HOST_TARGETS_ROOT / target / "crashes-triaged" / h
+
+
+def host_target_crashes(target):
+    """Local crashes-triaged scan for a host target. Runs the SAME _CRASH_SCAN_PY
+    emitter as the VM path, but locally (cwd in the crash dir), and reuses the
+    shared parser so host + VM crash rows are identical in shape."""
+    crashdir = HOST_TARGETS_ROOT / target / "crashes-triaged"
+    if not crashdir.is_dir():
+        return []
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", _CRASH_SCAN_PY],
+            cwd=str(crashdir), capture_output=True, text=True, timeout=30,
+        )
+        out = r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return _rows_from_scan_output(out)
+
+
+def host_read_text(path, max_bytes=200_000):
+    """Read a local text file (host crash artifacts). Returns text or None."""
+    try:
+        with open(path, "r", errors="replace") as f:
+            data = f.read(max_bytes)
+    except OSError:
+        return None
+    return data or None
+
+
+def _hexdump(data, width=16):
+    """xxd-ish hexdump of a bytes chunk, for the PoC preview pane."""
+    lines = []
+    for off in range(0, len(data), width):
+        chunk = data[off:off + width]
+        hexpart = " ".join(f"{b:02x}" for b in chunk)
+        hexpart = hexpart.ljust(width * 3 - 1)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{off:08x}: {hexpart}  {ascii_part}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def host_resolve_poc(target, h, which):
+    """Find a local PoC artifact for a host crash. 'mut' = the current poc.<ext>
+    (jackalope writes one poc.<ext>); 'original' = poc.original.<ext> if present."""
+    d = host_crash_dir(target, h)
+    if not d.is_dir():
+        return None
+    try:
+        names = sorted(p.name for p in d.iterdir() if p.is_file())
+    except OSError:
+        return None
+    if which == "original":
+        cands = [n for n in names if n.startswith("poc.original.")]
+        label = "original input"
+    elif which == "mut":
+        cands = [n for n in names if n.startswith("poc.") and not n.startswith("poc.original.")]
+        label = "current PoC"
+    else:
+        return None
+    if not cands:
+        return None
+    fname = cands[0]
+    ct = "application/pdf" if fname.lower().endswith(".pdf") else "application/octet-stream"
+    return {"fname": fname, "content_type": ct, "label": label}
+
+
+def host_poc_preview(target, h, fname, max_hex_bytes=512):
+    """First N bytes (hexdump) + size + sha256 of a local PoC. Dict or None."""
+    p = host_crash_dir(target, h) / fname
+    if not p.is_file():
+        return None
+    import hashlib
+    try:
+        size = p.stat().st_size
+        with open(p, "rb") as f:
+            head = f.read(max_hex_bytes)
+        sha = hashlib.sha256()
+        with open(p, "rb") as f:
+            for blk in iter(lambda: f.read(65536), b""):
+                sha.update(blk)
+    except OSError:
+        return None
+    return {"size": size, "sha": sha.hexdigest()[:16], "hexdump": _hexdump(head)}
+
+
+def host_serve_poc(target, h, which, max_bytes=10_000_000):
+    if not re.match(r'^[a-zA-Z0-9_-]+$', target) or not re.match(r'^[0-9a-f]{12}$', h):
+        return None
+    resolved = host_resolve_poc(target, h, which)
+    if not resolved:
+        return None
+    p = host_crash_dir(target, h) / resolved["fname"]
+    try:
+        with open(p, "rb") as f:
+            data = f.read(max_bytes)
+    except OSError:
+        return None
+    return data, resolved["fname"], resolved["content_type"]
+
+
+def set_host_status(target, h, new_state):
+    """Write .status for a host crash dir (local fs). Mirrors set_status_on_host."""
+    if not re.match(r'^[a-zA-Z0-9_-]+$', target):
+        return False, "bad target"
+    if not re.match(r'^[0-9a-f]{12}$', h):
+        return False, "bad hash"
+    if new_state not in VALID_STATES:
+        return False, f"bad state {new_state!r}"
+    d = host_crash_dir(target, h)
+    if not d.is_dir():
+        return False, "MISSING_DIR"
+    try:
+        (d / ".status").write_text(new_state + "\n")
+    except OSError as e:
+        return False, str(e)
+    CACHE.invalidate(f"status:{target}:{h}")
+    CACHE.invalidate(f"crashes:{target}")
+    return True, "ok"
+
+
+# --- per-target dispatchers: host (jackalope, local) vs VM (afl, orb) ---
+
+def roles_for(target):
+    return host_target_roles(target) if is_host_target(target) else target_roles(target)
+
+
+def crashes_for(target):
+    return host_target_crashes(target) if is_host_target(target) else target_crashes(target)
+
+
+def families_for(target):
+    # jackalope triage does not build crash families; VM targets keep their own.
+    return [] if is_host_target(target) else target_families(target)
+
+
+def read_crash_file(target, h, rel):
+    if is_host_target(target):
+        return host_read_text(host_crash_dir(target, h) / rel)
+    base = f"~/fuzzing/targets/{target}/crashes-triaged/{h}"
+    return read_vm_file(f"{base}/{rel}")
+
+
+def resolve_poc_for(target, h, which):
+    return host_resolve_poc(target, h, which) if is_host_target(target) else resolve_poc(target, h, which)
+
+
+def poc_preview_for(target, h, fname):
+    return host_poc_preview(target, h, fname) if is_host_target(target) else poc_preview(target, h, fname)
+
+
+def serve_poc_dispatch(target, h, which):
+    return host_serve_poc(target, h, which) if is_host_target(target) else serve_poc(target, h, which)
+
+
+def apply_status_change(target, h, new_state):
+    return set_host_status(target, h, new_state) if is_host_target(target) else set_status_on_host(target, h, new_state)
 
 
 # ---------- HTML rendering ----------
@@ -722,7 +1005,7 @@ def aggregate_kpis(health):
         "max_cov": 0.0, "min_last_find_s": None, "targets": len(health.get("targets") or []),
     }
     for t in health.get("targets") or []:
-        roles = CACHE.get(f"roles:{t}", 10, lambda t=t: target_roles(t))
+        roles = CACHE.get(f"roles:{t}", 10, lambda t=t: roles_for(t))
         for r in roles:
             for f, kk in [("execs_done", "execs_done"), ("saved_crashes", "saved_crashes"),
                           ("saved_hangs", "saved_hangs"), ("pending_total", "pending_total"),
@@ -822,9 +1105,9 @@ def fmt_age(secs):
 def render_target(target):
     if not re.match(r'^[a-zA-Z0-9_-]+$', target):
         return page("err", "<p>bad target name</p>")
-    roles = CACHE.get(f"roles:{target}", 10, lambda: target_roles(target))
-    crashes = CACHE.get(f"crashes:{target}", 60, lambda: target_crashes(target))
-    families = CACHE.get(f"families:{target}", 60, lambda: target_families(target))
+    roles = CACHE.get(f"roles:{target}", 10, lambda: roles_for(target))
+    crashes = CACHE.get(f"crashes:{target}", 60, lambda: crashes_for(target))
+    families = CACHE.get(f"families:{target}", 60, lambda: families_for(target))
 
     # Per-target KPIs from this target's roles
     def acc(field):
@@ -888,7 +1171,11 @@ def render_target(target):
     crashes = sorted(crashes, key=lambda c: c['_vscore'], reverse=True)
 
     reviewed_frames = frames_reviewed(crashes)
-    ledger = CACHE.get(f"ledger:{target}", 60, lambda: read_reviews_ledger(target))
+    # jackalope/host targets have no VM reviews ledger; avoid an orb round-trip.
+    if is_host_target(target):
+        ledger = {"count": 0, "cost_usd": 0.0, "seconds": 0}
+    else:
+        ledger = CACHE.get(f"ledger:{target}", 60, lambda: read_reviews_ledger(target))
 
     bucket = {}
     crash_rows = []
@@ -1191,15 +1478,15 @@ def render_status_form(target, h, current):
 def render_crash(target, h, flash=None):
     if not re.match(r'^[a-zA-Z0-9_-]+$', target) or not re.match(r'^[0-9a-f]{12}$', h):
         return page("err", "<p>bad path</p>")
-    base = f"~/fuzzing/targets/{target}/crashes-triaged/{h}"
-    meta_raw = CACHE.get(f"meta:{target}:{h}", 60, lambda: read_vm_file(f"{base}/meta.json"))
-    trace = CACHE.get(f"trace:{target}:{h}", 60, lambda: read_vm_file(f"{base}/trace.txt"))
-    notes = CACHE.get(f"notes:{target}:{h}", 60, lambda: read_vm_file(f"{base}/NOTES.md"))
-    review_raw = CACHE.get(f"review:{target}:{h}", 60, lambda: read_vm_file(f"{base}/REVIEW.md"))
-    report_raw = CACHE.get(f"report:{target}:{h}", 60, lambda: read_vm_file(f"{base}/REPORT.md"))
-    repro_raw = CACHE.get(f"repro:{target}:{h}", 60, lambda: read_vm_file(f"{base}/REPRO.md"))
-    poc_md_raw = CACHE.get(f"pocmd:{target}:{h}", 60, lambda: read_vm_file(f"{base}/POC.md"))
-    status_raw = CACHE.get(f"status:{target}:{h}", 30, lambda: read_vm_file(f"{base}/.status"))
+    # read_crash_file dispatches host (local fs) vs VM (orb); cache keys unchanged.
+    meta_raw = CACHE.get(f"meta:{target}:{h}", 60, lambda: read_crash_file(target, h, "meta.json"))
+    trace = CACHE.get(f"trace:{target}:{h}", 60, lambda: read_crash_file(target, h, "trace.txt"))
+    notes = CACHE.get(f"notes:{target}:{h}", 60, lambda: read_crash_file(target, h, "NOTES.md"))
+    review_raw = CACHE.get(f"review:{target}:{h}", 60, lambda: read_crash_file(target, h, "REVIEW.md"))
+    report_raw = CACHE.get(f"report:{target}:{h}", 60, lambda: read_crash_file(target, h, "REPORT.md"))
+    repro_raw = CACHE.get(f"repro:{target}:{h}", 60, lambda: read_crash_file(target, h, "REPRO.md"))
+    poc_md_raw = CACHE.get(f"pocmd:{target}:{h}", 60, lambda: read_crash_file(target, h, "POC.md"))
+    status_raw = CACHE.get(f"status:{target}:{h}", 30, lambda: read_crash_file(target, h, ".status"))
     status = normalize_status(status_raw)
 
     # Extract hits + top_frame from meta for the next-step recommendation
@@ -1257,13 +1544,13 @@ def render_crash(target, h, flash=None):
     # artifacts the browser can handle without corrupting the dashboard page.
     poc_blocks = []
     for which in ("original", "mut"):
-        resolved = resolve_poc(target, h, which)
+        resolved = resolve_poc_for(target, h, which)
         if not resolved:
             names = ", ".join(fname for fname, _, _ in POC_CANDIDATES[which])
             poc_blocks.append(f'<details><summary>{html.escape(which)} PoC — not found ({html.escape(names)})</summary></details>')
             continue
         fname = resolved["fname"]
-        info = poc_preview(target, h, fname)
+        info = poc_preview_for(target, h, fname)
         if not info:
             poc_blocks.append(f'<details><summary>{html.escape(fname)} — not found</summary></details>')
             continue
@@ -1427,7 +1714,7 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             target, h = m.group(1), m.group(2)
             new_state = form.get('new_status', '')
-            ok, msg = set_status_on_host(target, h, new_state)
+            ok, msg = apply_status_change(target, h, new_state)
             # 303 See Other → re-GET as crash page with flash
             flash_qs = f"?flash={'ok' if ok else 'err'}&msg={html.escape(msg, quote=True)}&state={html.escape(new_state, quote=True)}"
             self.send_response(303)
@@ -1460,7 +1747,7 @@ class Handler(BaseHTTPRequestHandler):
         if m: self._send(render_family(m.group(1), m.group(2))); return
         m = re.match(r'^/poc/([^/]+)/([^/]+)/(original|mut)/?$', path)
         if m:
-            result = serve_poc(m.group(1), m.group(2), m.group(3))
+            result = serve_poc_dispatch(m.group(1), m.group(2), m.group(3))
             if result is None or result[0] is None:
                 self._send("not found", "text/plain", 404); return
             data, fname, content_type = result

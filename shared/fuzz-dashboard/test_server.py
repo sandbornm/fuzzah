@@ -1,4 +1,4 @@
-import json, os, sys, unittest
+import json, os, sys, tempfile, time, unittest
 sys.path.insert(0, os.path.dirname(__file__))
 import server
 
@@ -136,6 +136,66 @@ class LedgerTests(unittest.TestCase):
         led = server.read_reviews_ledger("poppler")
         self.assertEqual(led["count"], 0)
         self.assertEqual(led["cost_usd"], 0.0)
+
+
+class JackalopeRolesTests(unittest.TestCase):
+    STATS = {
+        "engine": "jackalope", "pid": "23725", "alive": True,
+        "execs_per_sec": 280, "execs_done": 392097, "corpus_count": 316,
+        "coverage": 23874, "saved_crashes": 4, "last_find": 1781293714,
+        "start_time": 1781282475, "updated_at": 1781293867,
+    }
+
+    def _write(self, obj):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "stats.json")
+        with open(p, "w") as f:
+            json.dump(obj, f)
+        return p
+
+    def test_single_jackalope_role_shape(self):
+        roles = server.jackalope_roles_from_stats(self._write(self.STATS))
+        self.assertEqual(len(roles), 1)
+        r = roles[0]
+        # role identity + alive
+        self.assertEqual(r["role"], "jackalope")
+        self.assertIs(r["alive"], True)
+        # numeric stats are stringified (parity with AFL fuzzer_stats parsing)
+        self.assertEqual(r["execs_per_sec"], "280")
+        self.assertEqual(r["execs_done"], "392097")
+        self.assertEqual(r["corpus_count"], "316")
+        self.assertEqual(r["bitmap_cvg"], "23874")   # coverage offsets -> bitmap_cvg
+        self.assertEqual(r["saved_crashes"], "4")
+        self.assertEqual(r["unique_crashes"], "4")
+        self.assertEqual(r["pid"], "23725")
+        self.assertEqual(r["fuzzer_pid"], "23725")
+        # no-analogue fields default to "0"
+        self.assertEqual(r["pending_total"], "0")
+        self.assertEqual(r["pending_favs"], "0")
+        self.assertEqual(r["saved_hangs"], "0")
+        # last_find_age_s derived and non-negative
+        self.assertIsNotNone(r["last_find_age_s"])
+        self.assertGreaterEqual(r["last_find_age_s"], 0)
+
+    def test_roles_consumable_by_renderers(self):
+        # The aggregate/host_health math must not throw on a jackalope role.
+        r = server.jackalope_roles_from_stats(self._write(self.STATS))[0]
+        self.assertTrue(r["unique_crashes"].isdigit())
+        self.assertEqual(int(r["execs_done"]), 392097)
+        self.assertEqual(float(r["bitmap_cvg"].rstrip('%')), 23874.0)
+
+    def test_dead_fuzzer_alive_false(self):
+        dead = dict(self.STATS, alive=False)
+        r = server.jackalope_roles_from_stats(self._write(dead))[0]
+        self.assertIs(r["alive"], False)
+
+    def test_missing_or_bad_file_returns_empty(self):
+        self.assertEqual(server.jackalope_roles_from_stats("/no/such/stats.json"), [])
+        bad = tempfile.mkdtemp()
+        badp = os.path.join(bad, "stats.json")
+        with open(badp, "w") as f:
+            f.write("{ not json")
+        self.assertEqual(server.jackalope_roles_from_stats(badp), [])
 
 
 if __name__ == "__main__":

@@ -15,10 +15,76 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_ON_FUZZ_HOST="$SCRIPT_DIR/run-on-fuzz-host.sh"
 SELF_PATH="$SCRIPT_DIR/$(basename "$0")"
+HOST_TARGETS_ROOT="${FUZZAH_HOST_TARGETS_ROOT:-$HOME/fuzzing-mac/targets}"
+
+# ADDITIVE: macOS-host (jackalope) targets live on the local fs (no VM). They
+# expose a normalized findings/stats.json instead of AFL's fuzzer_stats. This
+# prints a dashboard section for them; it is a no-op when there are no such
+# targets, so the VM-only output is unchanged.
+print_host_targets_section() {
+  local hroot="$HOST_TARGETS_ROOT"
+  [[ -d "$hroot" ]] || return 0
+
+  local tdir found=0
+  for tdir in "$hroot"/*/; do
+    [[ -d "$tdir" && -f "$tdir/engine" ]] || continue
+    found=1; break
+  done
+  [[ "$found" == "1" ]] || return 0
+
+  echo
+  echo "── macOS-host targets (jackalope) ────────────────────────────────────"
+  printf '%-12s %-7s %-9s %-9s %-10s %-9s\n' \
+    "target" "alive" "execs/s" "corpus" "coverage" "crashes"
+  printf '%-12s %-7s %-9s %-9s %-10s %-9s\n' \
+    "------" "-----" "-------" "------" "--------" "-------"
+
+  for tdir in "$hroot"/*/; do
+    [[ -d "$tdir" && -f "$tdir/engine" ]] || continue
+    local target stats alive eps corpus cov tcrashes
+    target="$(basename "$tdir")"
+    stats="$tdir/findings/stats.json"
+    alive="no-stats"; eps="0"; corpus="0"; cov="0"
+    if [[ -s "$stats" ]]; then
+      if command -v jq >/dev/null 2>&1; then
+        alive="$(jq -r 'if .alive then "yes" else "no" end' "$stats" 2>/dev/null || echo '?')"
+        eps="$(jq -r '.execs_per_sec // 0'  "$stats" 2>/dev/null || echo 0)"
+        corpus="$(jq -r '.corpus_count // 0' "$stats" 2>/dev/null || echo 0)"
+        cov="$(jq -r '.coverage // 0'        "$stats" 2>/dev/null || echo 0)"
+      else
+        # python3 fallback (system interpreter; avoids the uv PATH shim).
+        local py; py="$(command -v /usr/bin/python3 || command -v python3 || true)"
+        if [[ -n "$py" ]]; then
+          read -r alive eps corpus cov < <("$py" - "$stats" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print("yes" if d.get("alive") else "no",
+      int(d.get("execs_per_sec") or 0),
+      int(d.get("corpus_count") or 0),
+      int(d.get("coverage") or 0))
+PY
+)
+        fi
+      fi
+    fi
+    tcrashes=0
+    if [[ -d "$tdir/crashes-triaged" ]]; then
+      tcrashes="$(find "$tdir/crashes-triaged" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+    fi
+    printf '%-12s %-7s %-9s %-9s %-10s %-9s\n' \
+      "$target" "$alive" "$eps" "$corpus" "$cov" "$tcrashes"
+  done
+}
 
 if [[ "$(uname -s)" != "Linux" || ! -d "$HOME/fuzzing" ]]; then
-  exec "$RUN_ON_FUZZ_HOST" \
+  # VM dashboard first (unchanged) — then append the macOS-host section.
+  "$RUN_ON_FUZZ_HOST" \
     "if [[ -f \"$SELF_PATH\" ]]; then bash \"$SELF_PATH\"; else bash \"\$HOME/fuzzig-shared/check-in.sh\"; fi"
+  print_host_targets_section
+  exit 0
 fi
 
 TARGETS_DIR="${TARGETS_DIR:-$HOME/fuzzing/targets}"
