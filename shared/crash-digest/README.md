@@ -58,6 +58,40 @@ review path for crashes in `review-requested`. Keep that separate from the
 six-hour digest unless you deliberately want the email job to spend model
 budget.
 
+## macOS Host (jackalope) Lane
+
+The AFL lane runs in the Linux VM and is read through
+`shared/run-on-fuzz-host.sh`. The macOS host also runs a
+[jackalope](https://github.com/googleprojectzero/Jackalope)-driven target
+(ImageIO) directly on the Mac. `collect.py` integrates it additively:
+
+- Root: `~/fuzzing-mac/targets/*`, overridable with `MAC_TARGETS_DIR`. A target
+  is a dir with an `engine` file (`jackalope`).
+- Read on the **local filesystem only** — never proxied into the VM. When
+  `collect.py` runs on the control host it proxies the AFL lane into the VM and
+  merges the host lane locally; gated on the root existing, so a VM-only host is
+  a no-op.
+- Per-target stats come from `findings/stats.json` (normalized:
+  `engine, alive, execs_per_sec, execs_done, corpus_count, coverage,
+  saved_crashes, last_find, start_time`) instead of AFL's per-role
+  `fuzzer_stats`. The snapshot marks these targets `engine: "jackalope"`; AFL
+  targets are unchanged and render as `engine: afl`.
+- Crashes come from `crashes-triaged/<hash>/{meta.json,.status,trace.txt,poc.*}`.
+  `meta.json` carries `top_frame, signature, hit_count, first_seen, fuzzers,
+  poc_size, engine`. The digest renders that base info and references
+  `trace.txt`.
+
+Jackalope crashes are triaged by the lane's own `triage-one.sh`, so they do
+**not** carry the AFL-replay enrichment (`REPORT.md`/`REPRO.md`/`POC.md`) that
+`promote-repros.py` writes for AFL crashes. The renderer degrades cleanly: it
+shows the meta.json base info plus the trace artifact and omits the enriched
+report/PoC sections rather than rendering them empty.
+
+**Follow-up (not built):** if a jackalope `REPORT.md`/`REPRO.md`/`POC.md`
+enrichment is ever wanted, add a jackalope-aware promoter (the lane already
+re-runs PoCs through `triage-one.sh`); do **not** extend `promote-repros.py` /
+`triage-drain.sh`, which are AFL-replay specific.
+
 ## Email Policy
 
 The digest sends links, not raw crash attachments.

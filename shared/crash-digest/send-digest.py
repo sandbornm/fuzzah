@@ -141,7 +141,12 @@ def promote_repros(timeout: int) -> str:
 
 
 def collect_snapshot(timeout: int) -> dict:
-    r = run_on_host(f"python3 {sh_quote(str(COLLECT))}", timeout=timeout)
+    # Run collect.py *locally* on the control host. It self-proxies the AFL/VM
+    # lane into the VM via run-on-fuzz-host.sh and merges the macOS host
+    # (jackalope) lane from the local filesystem. Running it through the proxy
+    # instead would hide the host lane, which only exists on this machine.
+    python_exe = sys.executable or "python3"
+    r = subprocess.run([python_exe, str(COLLECT)], text=True, capture_output=True, timeout=timeout)
     if r.returncode != 0:
         raise RuntimeError(f"collector failed rc={r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}")
     text = r.stdout.strip()
@@ -285,6 +290,10 @@ def totals(snapshot: dict) -> dict:
     return {"targets": len(targets), "alive": alive, "execs_per_sec": eps, "triaged": triaged, "unseen": unseen}
 
 
+def target_engine(t: dict) -> str:
+    return str(t.get("engine") or "afl")
+
+
 def render_target_rows(snapshot: dict, base_url: str) -> str:
     rows = []
     for t in snapshot.get("targets", []):
@@ -295,6 +304,7 @@ def render_target_rows(snapshot: dict, base_url: str) -> str:
         rows.append(
             "<tr>"
             f"<td><a href=\"{html.escape(url)}\">{html.escape(t.get('name', '?'))}</a></td>"
+            f"<td>{html.escape(target_engine(t))}</td>"
             f"<td>{int(t.get('alive_roles') or 0)}</td>"
             f"<td>{float(t.get('execs_per_sec') or 0):.0f}</td>"
             f"<td>{len(t.get('crashes', []))}</td>"
@@ -316,6 +326,17 @@ def render_crash_rows(crashes: list[dict], base_url: str, limit: int) -> str:
         if c.get("impact") or c.get("confidence") or c.get("issue_class"):
             bits = [str(x) for x in (c.get("impact"), c.get("confidence"), c.get("issue_class")) if x]
             assessment = f'<br><span class="muted">{html.escape(" · ".join(bits))}</span>'
+        # Host (jackalope) crashes have no AFL-replay enrichment; degrade to the
+        # base meta.json info plus the trace.txt artifact instead of an empty
+        # REPORT/POC note.
+        artifact = ""
+        if not (c.get("has_report") and c.get("has_poc")) and c.get("engine") == "jackalope":
+            note = ["jackalope"]
+            if c.get("signature"):
+                note.append(html.escape(str(c.get("signature"))))
+            if c.get("has_trace"):
+                note.append("trace.txt")
+            artifact = f'<br><span class="muted">{" · ".join(note)}</span>'
         rows.append(
             "<tr>"
             f"<td>{html.escape(c['target'])}</td>"
@@ -326,7 +347,7 @@ def render_crash_rows(crashes: list[dict], base_url: str, limit: int) -> str:
             f"<td>{changed}</td>"
             f"<td>{html.escape(reason)}</td>"
             f"<td><code>{html.escape(c.get('top_frame') or '?')}</code>"
-            f"{assessment}{report_ready}</td>"
+            f"{assessment}{report_ready}{artifact}</td>"
             "</tr>"
         )
     return "\n".join(rows)
@@ -432,7 +453,7 @@ li {{ margin:4px 0; }}
 </table>
 <h2>Target summary</h2>
 <table>
-<thead><tr><th>target</th><th>alive</th><th>exec/s</th><th>triaged</th><th>raw backlog</th><th>states</th></tr></thead>
+<thead><tr><th>target</th><th>engine</th><th>alive</th><th>exec/s</th><th>triaged</th><th>raw backlog</th><th>states</th></tr></thead>
 <tbody>{target_rows}</tbody>
 </table>
 <h2>Triage drain</h2>
@@ -468,6 +489,13 @@ def render_text(snapshot: dict, crashes: list[dict], base_url: str, limit: int, 
         lines.append(f"    frame: {c.get('top_frame') or '?'}")
         if c.get("has_report") and c.get("has_poc"):
             lines.append("    report: REPORT.md and POC.md ready on crash page")
+        elif c.get("engine") == "jackalope":
+            note = ["jackalope"]
+            if c.get("signature"):
+                note.append(str(c.get("signature")))
+            if c.get("has_trace"):
+                note.append("trace.txt")
+            lines.append("    artifacts: " + " · ".join(note))
     lines.extend(["", "Per-target highlights:"])
     groups = grouped_highlights(crashes)
     if not groups:
@@ -486,7 +514,8 @@ def render_text(snapshot: dict, crashes: list[dict], base_url: str, limit: int, 
         counts = target.get("state_counts") or {}
         states = " ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none"
         lines.append(
-            f"  {target.get('name')}: alive={target.get('alive_roles')} exec/s={float(target.get('execs_per_sec') or 0):.0f} "
+            f"  {target.get('name')}: engine={target_engine(target)} alive={target.get('alive_roles')} "
+            f"exec/s={float(target.get('execs_per_sec') or 0):.0f} "
             f"triaged={len(target.get('crashes', []))} raw_backlog={raw.get('unseen', 0)} states={states}"
         )
     lines.extend(["", "Triage drain:", triage_log or "(skipped)", "", "Repro promotion:", repro_log or "(skipped)"])
