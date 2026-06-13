@@ -2,8 +2,8 @@
 # test-run-on-target.sh — prove engine-based routing for run-on-target.sh using
 # FUZZAH_DRYRUN (no command is actually executed).
 #
-#   jackalope engine -> route=local
-#   afl / default    -> route=vm
+#   jackalope engine     -> route=local
+#   afl / fuzzilli / def  -> route=vm
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -40,6 +40,10 @@ printf 'jackalope\n' > "$tmproot/imageio/engine"
 out="$(FUZZAH_HOST_TARGETS_ROOT="$tmproot" FUZZAH_DRYRUN=1 bash "$ROT" imageio 'echo hi')"
 check "engine file routes local" "route=local engine=jackalope" "$out"
 rm -rf "$tmproot"
+
+# 5. fuzzilli engine via env override -> vm (VM-located like afl, proxied)
+out="$(FUZZAH_ENGINE_jsc=fuzzilli FUZZAH_DRYRUN=1 bash "$ROT" jsc 'echo hi')"
+check "fuzzilli engine (env) routes vm" "route=vm engine=fuzzilli" "$out"
 
 if [[ "$fail" == "0" ]]; then
   echo "ALL PASS"

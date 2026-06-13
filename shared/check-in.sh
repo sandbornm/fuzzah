@@ -116,6 +116,12 @@ for tdir in "$TARGETS_DIR"/*/; do
   target="$(basename "$tdir")"
   total_targets=$((total_targets + 1))
 
+  # Engine for this VM target (default afl). A fuzzilli target sources its row
+  # from findings/stats.json (handled after the AFL reads below) rather than
+  # fuzzer_stats; afl targets are unaffected.
+  engine="afl"
+  [[ -r "$tdir/engine" ]] && engine="$(tr -d '[:space:]' < "$tdir/engine" 2>/dev/null | head -c 64)"
+
   # Count live fuzzers by reading fuzzer_pid from each fuzzer_stats file and
   # probing it with kill -0. pgrep counts processes by pattern but can't
   # distinguish stale fuzzer_stats files left behind by a crashed afl-fuzz
@@ -154,6 +160,37 @@ for tdir in "$TARGETS_DIR"/*/; do
     if (( stats_execs > 0 )); then
       execs="$stats_execs"
     fi
+  fi
+
+  # ADDITIVE: a VM target with engine=fuzzilli carries a normalized
+  # findings/stats.json (engine/alive/execs_per_sec/...) instead of AFL
+  # fuzzer_stats, so the reads above found nothing for it. Source its live-fuzzer
+  # count + execs/s from stats.json here. afl targets keep the fuzzer_stats /
+  # afl-whatsup numbers computed above. If stats.json doesn't exist yet (the
+  # adapter is still warming up) the row stays 0/0 — i.e. calibrating/empty.
+  if [[ "$engine" == "fuzzilli" && -s "$tdir/findings/stats.json" ]]; then
+    fstats="$tdir/findings/stats.json"
+    f_alive="no"; f_eps="0"
+    if command -v jq >/dev/null 2>&1; then
+      f_alive="$(jq -r 'if .alive then "yes" else "no" end' "$fstats" 2>/dev/null || echo no)"
+      f_eps="$(jq -r '(.execs_per_sec // 0) | floor' "$fstats" 2>/dev/null || echo 0)"
+    else
+      py="$(command -v /usr/bin/python3 || command -v python3 || true)"
+      if [[ -n "$py" ]]; then
+        read -r f_alive f_eps < <("$py" - "$fstats" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print("yes" if d.get("alive") else "no", int(d.get("execs_per_sec") or 0))
+PY
+)
+      fi
+    fi
+    f_eps="$(printf '%s' "$f_eps" | tr -cd '0-9')"; f_eps="${f_eps:-0}"
+    n_fuzz=0; [[ "$f_alive" == "yes" ]] && n_fuzz=1
+    execs="$f_eps"
   fi
 
   triage_dir="$tdir/crashes-triaged"

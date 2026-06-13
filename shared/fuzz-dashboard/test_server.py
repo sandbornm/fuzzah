@@ -198,6 +198,98 @@ class JackalopeRolesTests(unittest.TestCase):
         self.assertEqual(server.jackalope_roles_from_stats(badp), [])
 
 
+class FuzzilliRolesTests(unittest.TestCase):
+    """A VM target with engine=fuzzilli exposes the SAME normalized stats.json
+    schema as jackalope, but read over the VM proxy. roles_from_stats_json shapes
+    both; only the role label + JSON source differ. crashes still come from the
+    normal VM crashes-triaged scan, so only the role path is new here."""
+
+    STATS = {
+        "engine": "fuzzilli", "pid": "5512", "alive": True,
+        "execs_per_sec": 1450, "execs_done": 9100000, "corpus_count": 2048,
+        "coverage": 88123, "saved_crashes": 9, "last_find": 1781293714,
+        "start_time": 1781200000, "updated_at": 1781293900,
+    }
+
+    def test_single_fuzzilli_role_shape(self):
+        roles = server.roles_from_stats_json(self.STATS, "fuzzilli")
+        self.assertEqual(len(roles), 1)
+        r = roles[0]
+        # synthetic single role, labelled 'fuzzilli'
+        self.assertEqual(r["role"], "fuzzilli")
+        self.assertIs(r["alive"], True)
+        # numeric stats stringified (parity with AFL fuzzer_stats / jackalope)
+        self.assertEqual(r["execs_per_sec"], "1450")
+        self.assertEqual(r["execs_done"], "9100000")
+        self.assertEqual(r["corpus_count"], "2048")
+        self.assertEqual(r["bitmap_cvg"], "88123")   # coverage offsets -> bitmap_cvg
+        self.assertEqual(r["saved_crashes"], "9")
+        self.assertEqual(r["unique_crashes"], "9")
+        self.assertEqual(r["pid"], "5512")
+        self.assertEqual(r["fuzzer_pid"], "5512")
+        # no-analogue fields default to "0"
+        self.assertEqual(r["pending_total"], "0")
+        self.assertEqual(r["pending_favs"], "0")
+        self.assertEqual(r["saved_hangs"], "0")
+        self.assertIsNotNone(r["last_find_age_s"])
+        self.assertGreaterEqual(r["last_find_age_s"], 0)
+
+    def test_role_is_consumable_by_aggregators(self):
+        r = server.roles_from_stats_json(self.STATS, "fuzzilli")[0]
+        # host_health/aggregate_kpis math must not throw on a fuzzilli role
+        self.assertTrue(r["unique_crashes"].isdigit())
+        self.assertEqual(int(r["execs_done"]), 9100000)
+        self.assertEqual(float(r["bitmap_cvg"].rstrip('%')), 88123.0)
+
+    def test_vm_fuzzilli_roles_reads_stats_via_proxy(self):
+        # vm_stats_json cats stats.json through run_on_host; stub that round-trip.
+        old = server.run_on_host
+        try:
+            server.run_on_host = lambda cmd, timeout=20: (json.dumps(self.STATS), "", 0)
+            roles = server.vm_fuzzilli_roles("jsc")
+        finally:
+            server.run_on_host = old
+        self.assertEqual(len(roles), 1)
+        self.assertEqual(roles[0]["role"], "fuzzilli")
+        self.assertEqual(roles[0]["execs_per_sec"], "1450")
+
+    def test_vm_fuzzilli_roles_empty_when_stats_missing(self):
+        old = server.run_on_host
+        try:
+            # cat of a missing stats.json yields empty stdout -> [] (renders idle)
+            server.run_on_host = lambda cmd, timeout=20: ("", "", 0)
+            self.assertEqual(server.vm_fuzzilli_roles("jsc"), [])
+        finally:
+            server.run_on_host = old
+
+    def test_roles_for_routes_fuzzilli_vm_target(self):
+        # jsc is a VM target (NOT a host/jackalope target) whose engine=fuzzilli,
+        # so roles_for must read stats.json, never target_roles' fuzzer_stats.
+        server.CACHE.invalidate()
+        old = (server.list_host_targets, server.vm_target_engine,
+               server.vm_stats_json, server.target_roles)
+        try:
+            server.list_host_targets = lambda: []          # jsc is not a host target
+            server.vm_target_engine = lambda t: "fuzzilli" if t == "jsc" else "afl"
+            server.vm_stats_json = lambda t: dict(self.STATS) if t == "jsc" else None
+            server.target_roles = lambda t: (_ for _ in ()).throw(
+                AssertionError("fuzzilli target must not hit the AFL fuzzer_stats path"))
+            roles = server.roles_for("jsc")
+        finally:
+            (server.list_host_targets, server.vm_target_engine,
+             server.vm_stats_json, server.target_roles) = old
+            server.CACHE.invalidate()
+        self.assertEqual(len(roles), 1)
+        self.assertEqual(roles[0]["role"], "fuzzilli")
+
+    def test_jackalope_shape_unchanged_after_refactor(self):
+        # Same shaper now serves both engines; jackalope label/keys must be intact.
+        jstats = dict(self.STATS, engine="jackalope")
+        r = server.roles_from_stats_json(jstats, "jackalope")[0]
+        self.assertEqual(r["role"], "jackalope")
+        self.assertEqual(r["unique_crashes"], "9")
+
+
 class StateEndpointTests(unittest.TestCase):
     """build_state() is the data path behind /api/state. We synthesize a
     reachable host + roles (no VM/orb), then assert the JSON shape the poller

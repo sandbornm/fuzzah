@@ -4,8 +4,9 @@
 #
 # Some targets are fuzzed by AFL++ inside the Linux VM (reached via orb / the
 # run-on-fuzz-host.sh wrapper). Others are fuzzed by Jackalope/TinyInst on the
-# macOS host itself (local fs, no orb). This wrapper hides that split so callers
-# can say "run X on target T" and not care where T lives.
+# macOS host itself (local fs, no orb). A fuzzilli target also lives in the VM
+# (it's proxied like afl), just with a different stats schema. This wrapper hides
+# that split so callers can say "run X on target T" and not care where T lives.
 #
 # Usage:
 #   run-on-target.sh <target> <shell-snippet>
@@ -16,8 +17,8 @@
 #   3. "afl"                     default
 #
 # Routing:
-#   jackalope            -> run locally via `bash -lc`
-#   afl / anything else  -> delegate to shared/run-on-fuzz-host.sh (the VM)
+#   jackalope                  -> run locally via `bash -lc`
+#   afl / fuzzilli / anything  -> delegate to shared/run-on-fuzz-host.sh (the VM)
 #
 # Env:
 #   FUZZAH_DRYRUN=1  print `route=local|vm engine=<e>` and exit (do not execute).
@@ -36,7 +37,7 @@ examples:
   run-on-target.sh poppler 'bash "$HOME/fuzzing/targets/poppler/scripts/status.sh"'
 
 env:
-  FUZZAH_ENGINE_<target>=jackalope|afl   force engine for <target>
+  FUZZAH_ENGINE_<target>=jackalope|afl|fuzzilli   force engine for <target>
   FUZZAH_HOST_TARGETS_ROOT=<dir>         host-target root (default ~/fuzzing-mac/targets)
   FUZZAH_DRYRUN=1                        print route+engine, do not execute
 EOF
@@ -65,8 +66,9 @@ fi
 engine="${engine:-afl}"
 
 case "$engine" in
-  jackalope) route="local" ;;
-  *)         route="vm" ;;
+  jackalope)    route="local" ;;
+  afl|fuzzilli) route="vm" ;;   # both VM-located; fuzzilli just has a different stats schema
+  *)            route="vm" ;;
 esac
 
 if [[ "${FUZZAH_DRYRUN:-0}" == "1" ]]; then

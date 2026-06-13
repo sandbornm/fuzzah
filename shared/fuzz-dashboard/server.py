@@ -155,6 +155,24 @@ def host_health():
         "total_execs_per_sec": 0.0, "total_crashes": 0,
     }
     for t in targets:
+        # ADDITIVE: a VM target with engine=fuzzilli reads its normalized
+        # findings/stats.json (proxied) instead of AFL fuzzer_stats. It has no
+        # afl-fuzz processes, so we skip target_proc_count and shape its row from
+        # the single synthetic role (mirroring the jackalope host rows below).
+        # AFL VM targets fall through to the unchanged fuzzer_stats path.
+        if vm_target_engine(t) == "fuzzilli":
+            roles = vm_fuzzilli_roles(t)
+            alive = sum(1 for r in roles if r['alive'])
+            eps = sum(float(r['execs_per_sec'] or 0) for r in roles if r['alive'])
+            crashes = max((int(r['unique_crashes']) for r in roles if r['unique_crashes'].isdigit()), default=0)
+            summary["by_target"][t] = {
+                "alive": alive, "calibrating": 0, "proc": alive,
+                "execs_per_sec": eps, "crashes": crashes, "roles_seen": len(roles),
+            }
+            summary["total_alive"] += alive
+            summary["total_execs_per_sec"] += eps
+            summary["total_crashes"] += crashes
+            continue
         roles = target_roles(t)
         alive = sum(1 for r in roles if r['alive'])
         eps = sum(float(r['execs_per_sec'] or 0) for r in roles if r['alive'])
@@ -620,18 +638,14 @@ def is_host_target(target):
     return target in list_host_targets()
 
 
-def jackalope_roles_from_stats(stats_path):
-    """Parse a jackalope findings/stats.json into the AFL-shaped role list the
-    dashboard renders. Returns a single synthetic 'jackalope' role (the engine
-    is single-process from the dashboard's POV), with the same keys target_roles
-    emits for AFL; fields with no jackalope analogue are "0"/"—". Returns [] if
-    the stats file is missing or unparseable."""
-    try:
-        with open(stats_path) as f:
-            s = json.load(f)
-    except (OSError, ValueError):
-        return []
-
+def roles_from_stats_json(s, role_name):
+    """Shape a normalized stats.json dict into the AFL-shaped single-role list the
+    dashboard renders, labelled `role_name`. The schema (engine/alive/
+    execs_per_sec/execs_done/corpus_count/coverage/saved_crashes/last_find/
+    start_time/updated_at/pid) is shared by jackalope (host-local) and fuzzilli
+    (VM, proxied); only the source of the JSON and the role label differ. Fields
+    with no analogue default to "0"/"—". The output keys match what target_roles
+    emits for AFL, so every renderer/aggregator treats it like any other role."""
     def _i(v):
         try:
             return int(v)
@@ -651,7 +665,7 @@ def jackalope_roles_from_stats(stats_path):
     pid = str(s.get("pid") or "")
 
     role = {
-        "role": "jackalope",
+        "role": role_name,
         "alive": alive,
         "stats_age_s": max(0, now - updated) if updated else -1,
         "fuzzer_pid": pid,
@@ -673,6 +687,18 @@ def jackalope_roles_from_stats(stats_path):
         "last_find_age_s": max(0, now - last_find) if last_find else None,
     }
     return [role]
+
+
+def jackalope_roles_from_stats(stats_path):
+    """Read a jackalope findings/stats.json FILE and shape it into the dashboard
+    role list (single synthetic 'jackalope' role). Thin file-reading wrapper over
+    roles_from_stats_json. Returns [] if the file is missing or unparseable."""
+    try:
+        with open(stats_path) as f:
+            s = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return roles_from_stats_json(s, "jackalope")
 
 
 def host_target_roles(target):
@@ -803,10 +829,79 @@ def set_host_status(target, h, new_state):
     return True, "ok"
 
 
-# --- per-target dispatchers: host (jackalope, local) vs VM (afl, orb) ---
+# ---------- VM (proxied) engine detection + fuzzilli stats — ADDITIVE ----------
+#
+# VM targets default to AFL (per-role fuzzer_stats). A VM target may instead
+# declare engine=fuzzilli via ~/fuzzing/targets/<t>/engine, in which case it
+# exposes a normalized findings/stats.json (the SAME schema jackalope emits)
+# rather than AFL fuzzer_stats. These helpers read that over the VM proxy and
+# reuse the shared roles_from_stats_json shaping, so a fuzzilli VM target renders
+# as a first-class target with a single synthetic 'fuzzilli' role. Its crashes
+# still come from the normal VM crashes-triaged scan (target_crashes). AFL VM
+# targets are untouched: their engine resolves to 'afl' and they keep the
+# fuzzer_stats + afl-whatsup path byte-for-byte.
+
+def _vm_target_engines():
+    """One proxied round-trip: {vm_target: engine}. engine is the first token of
+    ~/fuzzing/targets/<t>/engine, defaulting to 'afl' when the file is absent."""
+    cmd = (
+        'for d in ~/fuzzing/targets/*/; do '
+        '[ -d "$d" ] || continue; '
+        't=$(basename "$d"); e=afl; '
+        '[ -r "$d/engine" ] && e=$(tr -d "[:space:]" < "$d/engine" | head -c 64); '
+        'echo "$t|$e"; '
+        'done'
+    )
+    out, _, _ = run_on_host(cmd)
+    engines = {}
+    for line in (out or "").strip().splitlines():
+        if "|" in line:
+            t, e = line.split("|", 1)
+            engines[t.strip()] = e.strip() or "afl"
+    return engines
+
+
+def vm_target_engines():
+    """Cached {vm_target: engine} map. One shared round-trip for all VM targets,
+    so the per-target engine check below is effectively free."""
+    return CACHE.get("vm_engines", 15, _vm_target_engines)
+
+
+def vm_target_engine(target):
+    """Engine for a single VM target (cached batch read). 'afl' if unset/unknown."""
+    return vm_target_engines().get(target, "afl")
+
+
+def vm_stats_json(target):
+    """Read a VM target's normalized findings/stats.json via the proxy. Dict or
+    None (None when the adapter hasn't written it yet, or it's unparseable)."""
+    path = f"~/fuzzing/targets/{target}/findings/stats.json"
+    out, _, _ = run_on_host(f'cat {vm_path(path)} 2>/dev/null', timeout=15)
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+def vm_fuzzilli_roles(target):
+    """Single synthetic 'fuzzilli' role for a VM fuzzilli target, from its proxied
+    stats.json. [] if the stats file is missing/unparseable (renders as idle)."""
+    obj = vm_stats_json(target)
+    if obj is None:
+        return []
+    return roles_from_stats_json(obj, "fuzzilli")
+
+
+# --- per-target dispatchers: host (jackalope, local) vs VM (afl/fuzzilli, orb) ---
 
 def roles_for(target):
-    return host_target_roles(target) if is_host_target(target) else target_roles(target)
+    if is_host_target(target):
+        return host_target_roles(target)
+    if vm_target_engine(target) == "fuzzilli":
+        return vm_fuzzilli_roles(target)
+    return target_roles(target)
 
 
 def crashes_for(target):
