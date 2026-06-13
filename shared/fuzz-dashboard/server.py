@@ -136,7 +136,12 @@ def list_targets():
 
 def target_proc_count(target):
     """Count of live afl-fuzz processes for a target (independent of fuzzer_stats freshness)."""
-    out, _, _ = run_on_host(f'pgrep -cf "afl-fuzz .* targets/{shlex.quote(target)}/" 2>/dev/null || echo 0', timeout=8)
+    # [a]fl-fuzz bracket trick: a plain "afl-fuzz ..." pattern makes `pgrep -f` match the
+    # wrapper shell running this very command (the literal pattern is in its own argv), so
+    # proc was always >=1 — a STOPPED target (alive=0, proc=1) then rendered as
+    # "calibrating" instead of idle. The bracket makes the regex still match real afl-fuzz
+    # while never matching the "[a]fl-fuzz" literal in the pgrep invocation's command line.
+    out, _, _ = run_on_host(f'pgrep -cf "[a]fl-fuzz .* targets/{shlex.quote(target)}/" 2>/dev/null || echo 0', timeout=8)
     try:
         return int(out.strip().splitlines()[-1])
     except (ValueError, IndexError):
