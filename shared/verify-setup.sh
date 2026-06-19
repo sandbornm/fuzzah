@@ -86,6 +86,7 @@ required_files=(
   "$FUZZAH_SHARED_DIR/fuzz-crashes.sh"
   "$FUZZAH_SHARED_DIR/scaffold-target.sh"
   "$FUZZAH_SHARED_DIR/bootstrap-target.sh"
+  "$FUZZAH_SHARED_DIR/setup-macos-orb.sh"
   "$FUZZAH_SHARED_DIR/fuzz-watchdog.sh"
   "$FUZZAH_SHARED_DIR/fuzz-watchdog.service"
   "$FUZZAH_REPO_ROOT/examples/README.md"
