@@ -36,6 +36,29 @@ RESEND_ENDPOINT = "https://api.resend.com/emails"
 NOISE_RE = re.compile(r"(memlimit|timeout|unknown-js-crash|unknown-sig|no-frames|killed|rc=124|rc=137)", re.I)
 ACTIONABLE_STATES = {"new", "review-requested", "reviewed", "repro-ok"}
 DONE_STATES = {"ignore", "dup", "reported"}
+DEFAULT_MIN_REPORT_PRIORITY = 80
+TRUE_VALUES = {"1", "true", "yes", "on"}
+FALSE_VALUES = {"0", "false", "no", "off"}
+MEMORY_ISSUE_RE = re.compile(
+    r"(?:^|[-_])(?:heap-buffer-overflow|stack-buffer-overflow|global-buffer-overflow|"
+    r"heap-use-after-free|stack-use-after-return|stack-use-after-scope|"
+    r"use-after-poison|container-overflow|double-free|bad-free|alloc-dealloc-mismatch)(?:$|[-_])|"
+    r"memory-bug|memory-corruption|memory-safety|"
+    r"(?:^|[-_])segv(?:$|[-_])|sigsegv|exc_bad_access",
+    re.I,
+)
+MEMORY_TEXT_RE = re.compile(
+    r"AddressSanitizer: (?:heap-buffer-overflow|stack-buffer-overflow|global-buffer-overflow|"
+    r"heap-use-after-free|stack-use-after-return|stack-use-after-scope|"
+    r"use-after-poison|container-overflow|double-free|bad-free|alloc-dealloc-mismatch|deadlysignal)|"
+    r"\bSIGSEGV\b|segmentation fault|EXC_BAD_ACCESS|SEGV on unknown address",
+    re.I,
+)
+LOW_VALUE_RE = re.compile(
+    r"assertion|ubsan|timeout|js-exception|parser-dos|harness-amplified|"
+    r"stack-exhaustion-dos|input-validation|robustness|rangeerror|typeerror",
+    re.I,
+)
 
 
 def sh_quote(s: str) -> str:
@@ -190,6 +213,66 @@ def is_noise(frame: str) -> bool:
     return bool(NOISE_RE.search(frame or ""))
 
 
+def env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in TRUE_VALUES:
+        return True
+    if normalized in FALSE_VALUES:
+        return False
+    return default
+
+
+def digest_min_report_priority() -> int:
+    try:
+        value = int(os.environ.get("FUZZ_DIGEST_MIN_REPORT_PRIORITY", str(DEFAULT_MIN_REPORT_PRIORITY)))
+    except ValueError:
+        value = DEFAULT_MIN_REPORT_PRIORITY
+    return max(0, min(100, value))
+
+
+def excluded_targets() -> set[str]:
+    raw = os.environ.get("FUZZ_DIGEST_EXCLUDE_TARGETS", "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def filter_snapshot_targets(snapshot: dict, excluded: set[str]) -> dict:
+    if not excluded:
+        return snapshot
+    filtered = dict(snapshot)
+    filtered["targets"] = [
+        target for target in snapshot.get("targets", [])
+        if str(target.get("name") or "") not in excluded
+    ]
+    return filtered
+
+
+def high_value_signal(c: dict) -> bool:
+    """Return true only for crash metadata that looks like memory corruption.
+
+    This is intentionally stricter than "actionable": assertions, UBSan-only
+    reports, JavaScript exceptions, and parser DoS can remain in the dashboard,
+    but they should not page the operator unless native memory-safety evidence
+    is present.
+    """
+    fields = [
+        c.get("issue_class"),
+        c.get("impact"),
+        c.get("assessed_severity"),
+        c.get("severity"),
+        c.get("top_frame"),
+        c.get("signature"),
+    ]
+    blob = "\n".join(str(x) for x in fields if x)
+    if MEMORY_ISSUE_RE.search(blob) or MEMORY_TEXT_RE.search(blob):
+        return True
+    if LOW_VALUE_RE.search(blob):
+        return False
+    return False
+
+
 def score_crash(c: dict, previous: dict | None) -> tuple[int, list[str], bool]:
     status = c.get("status") or "new"
     frame = c.get("top_frame") or "?"
@@ -263,6 +346,8 @@ def flatten_rank(snapshot: dict, state: dict) -> tuple[list[dict], list[dict]]:
     previous = state.get("sent", {}) if isinstance(state.get("sent"), dict) else {}
     ranked = []
     all_crashes = []
+    min_priority = digest_min_report_priority()
+    only_high_value = env_flag("FUZZ_DIGEST_ONLY_HIGH_VALUE", True)
     for target in snapshot.get("targets", []):
         for crash in target.get("crashes", []):
             c = dict(crash)
@@ -274,8 +359,15 @@ def flatten_rank(snapshot: dict, state: dict) -> tuple[list[dict], list[dict]]:
             c["reasons"] = reasons
             c["changed"] = changed
             c["dashboard_path"] = crash.get("dashboard_path") or f"/c/{c['target']}/{c.get('hash')}"
+            c["high_value"] = high_value_signal(c)
             all_crashes.append(c)
-            if c.get("status") in ACTIONABLE_STATES and score >= 35:
+            if (
+                c.get("status") in ACTIONABLE_STATES
+                and score >= min_priority
+                and (not only_high_value or c["high_value"])
+            ):
+                if only_high_value:
+                    c["reasons"].append("memory-corruption signal")
                 ranked.append(c)
     ranked.sort(key=lambda c: (c["changed"], c["score"], int(c.get("hit_count") or 0)), reverse=True)
     return ranked, all_crashes
@@ -384,7 +476,7 @@ def render_html(snapshot: dict, crashes: list[dict], base_url: str, limit: int, 
     t = totals(snapshot)
     rows = render_crash_rows(crashes, base_url, limit)
     if not rows:
-        rows = '<tr><td colspan="8">No actionable crash clusters met the interestingness threshold.</td></tr>'
+        rows = '<tr><td colspan="8">No crash clusters met the high-value memory-corruption gate.</td></tr>'
     target_rows = render_target_rows(snapshot, base_url)
     highlight_rows = render_target_highlights_html(crashes, base_url)
     return f"""<!doctype html>
@@ -441,14 +533,14 @@ li {{ margin:4px 0; }}
   <div class="kpi"><div class="label">execs/sec</div><div class="value">{t['execs_per_sec']:.0f}</div></div>
   <div class="kpi"><div class="label">untriaged raw crashes</div><div class="value">{t['unseen']}</div></div>
 </div>
-<h2>Interesting crash clusters</h2>
+<h2>High-value crash clusters</h2>
 <table>
 <thead><tr><th>target</th><th>crash</th><th>status</th><th>hits</th><th>priority</th><th>changed</th><th>why</th><th>top frame</th></tr></thead>
 <tbody>{rows}</tbody>
 </table>
 <h2>Per-target highlights</h2>
 <table>
-<thead><tr><th>target</th><th>top actionable clusters</th></tr></thead>
+<thead><tr><th>target</th><th>top high-value clusters</th></tr></thead>
 <tbody>{highlight_rows}</tbody>
 </table>
 <h2>Target summary</h2>
@@ -474,10 +566,10 @@ def render_text(snapshot: dict, crashes: list[dict], base_url: str, limit: int, 
         "",
         f"Targets: {t['targets']}  Alive fuzzers: {t['alive']}  Execs/sec: {t['execs_per_sec']:.0f}  Raw backlog: {t['unseen']}",
         "",
-        "Interesting crash clusters:",
+        "High-value crash clusters:",
     ]
     if not crashes:
-        lines.append("  none above threshold")
+        lines.append("  none above the memory-corruption gate")
     for c in crashes[:limit]:
         url = dashboard_url(base_url, c["dashboard_path"])
         reasons = ", ".join(c.get("reasons") or [])
@@ -531,8 +623,8 @@ def subject_for(snapshot: dict, crashes: list[dict], limit: int) -> str:
             return f"[fuzzah] top {shown} of {changed} changed crash cluster(s)"
         return f"[fuzzah] {changed} changed crash cluster(s)"
     if crashes:
-        return f"[fuzzah] {len(crashes)} actionable crash cluster(s), no new changes"
-    return f"[fuzzah] no new interesting crashes ({t['alive']} fuzzers, {t['execs_per_sec']:.0f} exec/s)"
+        return f"[fuzzah] {len(crashes)} high-value crash cluster(s), no new changes"
+    return f"[fuzzah] no high-value memory-corruption crashes ({t['alive']} fuzzers, {t['execs_per_sec']:.0f} exec/s)"
 
 
 def write_artifacts(log_dir: Path, snapshot: dict, html_body: str, text_body: str) -> tuple[Path, Path, Path]:
@@ -611,7 +703,7 @@ def main() -> int:
     repro_log = "(skipped)"
     if not args.skip_repro:
         repro_log = promote_repros(args.repro_timeout)
-    snapshot = collect_snapshot(args.collect_timeout)
+    snapshot = filter_snapshot_targets(collect_snapshot(args.collect_timeout), excluded_targets())
     state = load_state(state_path)
     ranked, all_crashes = flatten_rank(snapshot, state)
     html_body = render_html(snapshot, ranked, base_url, args.limit, triage_log, repro_log)

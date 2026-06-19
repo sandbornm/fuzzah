@@ -52,6 +52,28 @@ JavaScript `Buffer` bounds check unless ASAN/native evidence says otherwise.
 The reports explicitly call this out so parser DoS and native memory corruption
 are not conflated.
 
+For `jsc` / Fuzzilli crashes, `promote-repros.py` replays `poc.reduced.js` when
+present, otherwise `poc.js`, using the recorded Fuzzilli `processArguments`
+minus `--reprl`. It prefers an ASan JSC shell when one is available at one of:
+
+- `JSC_ASAN_BIN` or `<TARGET>_ASAN_BIN` in the environment, for manual testing
+- `~/fuzzing/targets/jsc-asan/WebKitBuild/bin/jsc`
+- `~/fuzzing/targets/jsc/WebKitBuild-ASAN/bin/jsc`
+- `~/fuzzing/targets/jsc/WebKitBuildASAN/bin/jsc`
+- `~/fuzzing/targets/jsc/build-asan/bin/jsc`
+
+If no ASan shell exists, it falls back to the normal Fuzzilli JSC shell. JSC
+reports classify `ERROR: AddressSanitizer: ...` as `memory-bug/HIGH`. JSC
+assertions / `SHOULD NEVER BE REACHED`, UBSan-only findings, and ASan replay
+timeouts are intentionally low-priority: they remain visible in the dashboard
+for correctness/corpus value, but the digest does not flag them for manual
+security triage unless native memory-corruption evidence appears. For the ASan
+replay shell, `promote-repros.py` unsets build-only `JSC_ASAN_*` variables
+before running `jsc`, keeps ASan halting, and redirects non-halting UBSan output
+to `/tmp/fuzzah-jsc-ubsan.*`. This avoids known WebKit/libpas startup UBSan
+noise masking the actual PoC signal. Use a dedicated UBSan build with
+suppressions for UB-only JSC research.
+
 `REVIEW.md` is the place for richer LLM-assisted root cause analysis. The
 existing `shared/fuzz-dashboard/review-drain.sh` uses a non-interactive Claude
 review path for crashes in `review-requested`. Keep that separate from the
@@ -145,6 +167,15 @@ bash shared/run-on-fuzz-host.sh \
   'python3 /Users/minimo/fuzzig/fuzzah/shared/crash-digest/promote-repros.py --limit 6'
 ```
 
+Run JSC promotion with an explicit ASan shell:
+
+```sh
+bash shared/run-on-fuzz-host.sh \
+  'JSC_ASAN_BIN="$HOME/fuzzing/targets/jsc-asan/WebKitBuild/bin/jsc" \
+   python3 /Users/minimo/fuzzig/fuzzah/shared/crash-digest/promote-repros.py \
+     --target jsc --force --limit 3'
+```
+
 Install Mac launchd jobs:
 
 ```sh
@@ -192,22 +223,27 @@ Set these in the private env file:
 | `FUZZ_DIGEST_REPRO_LIMIT` | `6` | max crash clusters promoted to reports per digest |
 | `FUZZ_DIGEST_REPRO_TIMEOUT` | `45` | replay timeout per promoted crash |
 | `FUZZ_DIGEST_MAX_CRASHES` | `12` | max rows shown in email |
+| `FUZZ_DIGEST_MIN_REPORT_PRIORITY` | `80` | minimum `report_priority` for email top-list eligibility |
+| `FUZZ_DIGEST_ONLY_HIGH_VALUE` | `1` | require a memory-corruption signal for email top-list eligibility |
+| `FUZZ_DIGEST_EXCLUDE_TARGETS` | empty | comma-separated targets hidden from digest snapshot/email |
 
 Keep the caps conservative. The digest should summarize progress, not compete
 with active fuzzers.
 
-The email has a global top table plus a per-target highlights section. The
-global table can be dominated by an older target with many high-priority
-changes; per-target highlights keep newer targets such as `node-oracledb`
-visible without inflating every raw AFL hit into the top list.
+The email has a global top table plus a per-target highlights section. By
+default, both sections are gated to high-value memory-corruption candidates:
+`report_priority >= 80` and an ASan/native memory-safety signal. Assertions,
+UBSan-only reports, JavaScript exceptions, and parser DoS remain in the
+dashboard, but they do not consume the six-hour manual-review channel. Set
+`FUZZ_DIGEST_ONLY_HIGH_VALUE=0` only for an explicit broad triage pass.
 
 The dashboard and digest treat `REPORT.md` `report_priority` as the displayed
 priority and primary ordering signal when it exists. Raw AFL `hit_count` remains
-visible because it describes stability/repro frequency, but it should not make a
-safe parser exception look more security-relevant than a lower-hit higher-impact
-finding. The HTML email intentionally uses a light high-contrast palette with
-light-only color-scheme hints; this survives mobile mail clients better than the
-dark dashboard palette.
+visible because it describes stability/repro frequency, but it should not make
+a safe parser exception or assertion look more security-relevant than a
+lower-hit memory-corruption finding. The HTML email intentionally uses a light
+high-contrast palette with light-only color-scheme hints; this survives mobile
+mail clients better than the dark dashboard palette.
 
 ## External References
 

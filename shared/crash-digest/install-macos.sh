@@ -85,6 +85,9 @@ write_env_file() {
     echo "FUZZ_DIGEST_MAX_TRIAGE_TOTAL=75"
     echo "FUZZ_DIGEST_REPRO_LIMIT=6"
     echo "FUZZ_DIGEST_REPRO_TIMEOUT=45"
+    echo "FUZZ_DIGEST_MIN_REPORT_PRIORITY=80"
+    echo "FUZZ_DIGEST_ONLY_HIGH_VALUE=1"
+    echo "FUZZ_DIGEST_EXCLUDE_TARGETS=poppler,libvpx"
     if [[ -n "$key" && "$key" != "REPLACE_ME" ]]; then
       echo "RESEND_API_KEY=$key"
     else

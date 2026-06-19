@@ -34,6 +34,25 @@ NOISE_RE = re.compile(r"(memlimit|timeout|unknown-js-crash|unknown-sig|no-frames
 DONE_STATES = {"ignore", "dup", "reported"}
 PROMOTABLE_STATES = {"new", "review-requested", "reviewed", "repro-ok"}
 FRAME_LOC_RE = re.compile(r"\((?P<path>.*?/src/(?P<rel>lib/[^:]+)):(?P<line>\d+):(?P<col>\d+)\)")
+ASAN_ERROR_RE = re.compile(
+    r"ERROR: AddressSanitizer: "
+    r"(heap-buffer-overflow|stack-buffer-overflow|global-buffer-overflow|"
+    r"heap-use-after-free|stack-use-after-return|stack-use-after-scope|"
+    r"use-after-poison|container-overflow|double-free|bad-free|"
+    r"alloc-dealloc-mismatch|initialization-order-fiasco|odr-violation)",
+    re.I,
+)
+ASAN_OPTIONS = "abort_on_error=1:symbolize=1:detect_leaks=0:halt_on_error=1:print_stacktrace=1"
+UBSAN_OPTIONS = "print_stacktrace=1:halt_on_error=1"
+JSC_UBSAN_LOG = "/tmp/fuzzah-jsc-ubsan"
+JSC_UBSAN_OPTIONS = f"halt_on_error=0:print_stacktrace=0:log_path={JSC_UBSAN_LOG}"
+JSC_ENV_UNSET = (
+    "JSC_ASAN_NICE",
+    "JSC_ASAN_BUILD_MODE",
+    "JSC_ASAN_CLEAN",
+    "JSC_ASAN_OPT_FLAGS",
+    "JSC_ASAN_BUILTINS_LIB",
+)
 
 
 def sh_quote(s: str) -> str:
@@ -101,6 +120,78 @@ def symbolized(frame: str) -> bool:
     return bool(frame and frame != "?" and not NOISE_RE.search(frame))
 
 
+def is_jsc_target(target_dir: Path, meta: dict) -> bool:
+    return target_dir.name in {"jsc", "jsc-asan"} or meta.get("engine") == "fuzzilli"
+
+
+def jsc_process_args(target_dir: Path) -> list[str]:
+    settings = read_json(target_dir / "findings" / "settings.json")
+    raw = settings.get("processArguments") or []
+    if not isinstance(raw, list):
+        return []
+    return [str(arg) for arg in raw if str(arg) and str(arg) != "--reprl"]
+
+
+def executable(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def target_env_name(target_dir: Path, suffix: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9]", "_", target_dir.name).upper()
+    return f"{safe}_{suffix}"
+
+
+def jsc_replay_binary(target_dir: Path) -> tuple[Path, str]:
+    """Return the best JSC shell for replay plus the lane label.
+
+    Prefer an ASan/UBSan shell when one has been built. The explicit env var is
+    useful while iterating locally; the path conventions are for unattended
+    digest runs on the fuzz host.
+    """
+    env_names = [target_env_name(target_dir, "ASAN_BIN"), "JSC_ASAN_BIN"]
+    for name in env_names:
+        configured = os.environ.get(name)
+        if configured:
+            path = Path(configured).expanduser()
+            if executable(path):
+                return path, f"asan ({name})"
+
+    siblings = []
+    if target_dir.name != "jsc-asan":
+        siblings.append(target_dir.parent / f"{target_dir.name}-asan" / "WebKitBuild" / "bin" / "jsc")
+    candidates = [
+        target_dir / "WebKitBuild-ASAN" / "bin" / "jsc",
+        target_dir / "WebKitBuildASAN" / "bin" / "jsc",
+        target_dir / "build-asan" / "bin" / "jsc",
+        *siblings,
+        target_dir / "WebKitBuild" / "bin" / "jsc",
+    ]
+    for path in candidates:
+        if executable(path):
+            label = "asan" if re.search(r"asan", str(path), re.I) else "default"
+            return path, label
+    raise FileNotFoundError(f"no JSC replay binary found for {target_dir}")
+
+
+def jsc_shell_reproducer(target_dir: Path, crash_dir: Path, timeout_s: int) -> str:
+    poc = first_existing([crash_dir / "poc.reduced.js", crash_dir / "poc.js"])
+    if poc is None:
+        raise FileNotFoundError(f"no JavaScript PoC file in {crash_dir}")
+    binary, _label = jsc_replay_binary(target_dir)
+    argv = [str(binary), *jsc_process_args(target_dir), str(poc)]
+    unset_names = dict.fromkeys((*JSC_ENV_UNSET, "JSC_ASAN_BIN", target_env_name(target_dir, "ASAN_BIN")))
+    unset_args = " ".join(f"-u {name}" for name in unset_names)
+    cleanup = f"rm -f {JSC_UBSAN_LOG}.*"
+    return (
+        f"{cleanup}; "
+        f"timeout {timeout_s} env {unset_args} "
+        f"ASAN_OPTIONS={shlex.quote(ASAN_OPTIONS)} "
+        f"UBSAN_OPTIONS={shlex.quote(JSC_UBSAN_OPTIONS)} "
+        + " ".join(shlex.quote(arg) for arg in argv)
+        + f"; rc=$?; {cleanup}; exit $rc"
+    )
+
+
 def parse_start_fuzz(script: Path) -> tuple[str, str]:
     text = read_text(script)
     harness_subpath = ""
@@ -118,6 +209,9 @@ def shell_reproducer(target_dir: Path, crash_dir: Path, meta: dict, timeout_s: i
     reproducer = str(meta.get("reproducer") or "").strip()
     if reproducer:
         return f"timeout {timeout_s} bash -lc {sh_quote(reproducer)}"
+
+    if is_jsc_target(target_dir, meta):
+        return jsc_shell_reproducer(target_dir, crash_dir, timeout_s)
 
     target = target_dir.name
     harness_subpath, harness_args = parse_start_fuzz(target_dir / "scripts" / "start-fuzz.sh")
@@ -138,8 +232,8 @@ def shell_reproducer(target_dir: Path, crash_dir: Path, meta: dict, timeout_s: i
         args = f"{harness_args} < {shlex.quote(str(poc))}"
     return (
         f"timeout {timeout_s} env "
-        "ASAN_OPTIONS=abort_on_error=1:symbolize=1:detect_leaks=0:halt_on_error=1:print_stacktrace=1 "
-        "UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 "
+        f"ASAN_OPTIONS={shlex.quote(ASAN_OPTIONS)} "
+        f"UBSAN_OPTIONS={shlex.quote(UBSAN_OPTIONS)} "
         f"{shlex.quote(str(binary))} {args}"
     )
 
@@ -147,12 +241,20 @@ def shell_reproducer(target_dir: Path, crash_dir: Path, meta: dict, timeout_s: i
 def classify(text: str, top_frame: str, rc: int, timed_out: bool) -> tuple[str, str, str]:
     blob = f"{top_frame}\n{text}"
     low = blob.lower()
-    if timed_out:
+    if timed_out or rc == 124:
         return "timeout", "LOW", "investigate if repeatable outside timeout"
-    if any(x in low for x in ("heap-buffer-overflow", "stack-buffer-overflow", "heap-use-after-free", "double-free", "global-buffer-overflow")):
+    if ASAN_ERROR_RE.search(blob) or any(
+        x in low
+        for x in (
+            "attempting free on address which was not malloc",
+            "addresssanitizer: deadlysignal",
+        )
+    ):
         return "memory-bug", "HIGH", "file-upstream"
     if "undefinedbehaviorsanitizer" in low or "runtime error:" in low:
-        return "ubsan", "MED", "file-upstream"
+        return "ubsan", "LOW", "monitor unless linked to memory corruption"
+    if "assertion failed:" in low or "should never be reached" in low or "release_assert" in low:
+        return "assertion", "LOW", "defer unless release/ASan replay shows memory corruption"
     if "sigsegv" in low or "segmentation fault" in low:
         return "segv", "HIGH", "file-upstream"
     if "sigtrap" in low:
@@ -210,7 +312,7 @@ def node_oracledb_assessment(meta: dict, top_frame: str, output: str) -> dict:
         "impact": "robustness",
         "severity": "LOW",
         "confidence": "medium",
-        "report_priority": 45,
+        "report_priority": 20,
         "triage_verdict": "Reproducible JavaScript exception. No ASAN/native memory-corruption signal was observed.",
         "reachability": "Unknown from the harness alone; confirm against the product call path before filing as security.",
         "harness_notes": "The harness converts unexpected JavaScript exceptions to process aborts so AFL records them. The abort itself is not the product bug.",
@@ -230,7 +332,7 @@ def node_oracledb_assessment(meta: dict, top_frame: str, output: str) -> dict:
                 "impact": "parser-dos",
                 "severity": "MED",
                 "confidence": "high",
-                "report_priority": 78,
+                "report_priority": 55,
                 "reachability": (
                     "Potentially reachable when Thin mode decodes OSON/JSON payloads from the database or local OSON data. "
                     "Malformed OSON should reject cleanly instead of throwing raw TypeError/RangeError."
@@ -243,7 +345,7 @@ def node_oracledb_assessment(meta: dict, top_frame: str, output: str) -> dict:
                 {
                     "issue_class": "oson-recursion-dos",
                     "impact": "stack-exhaustion-dos",
-                    "report_priority": 86,
+                    "report_priority": 60,
                     "triage_verdict": (
                         "Recursive OSON decoding can exhaust the JavaScript stack. This is a stronger DoS signal than a simple short-buffer read."
                     ),
@@ -261,7 +363,7 @@ def node_oracledb_assessment(meta: dict, top_frame: str, output: str) -> dict:
                 "impact": "input-validation-robustness",
                 "severity": "LOW",
                 "confidence": "high",
-                "report_priority": 62,
+                "report_priority": 25,
                 "reachability": (
                     "Reachable through connection-string parsing. Security impact depends on whether an application accepts untrusted connection strings."
                 ),
@@ -274,9 +376,9 @@ def node_oracledb_assessment(meta: dict, top_frame: str, output: str) -> dict:
                 "issue_class": "sqlnet-short-packet-bounds",
                 "surface": "SQL*Net receive packet parser",
                 "impact": "client-side-parser-dos",
-                "severity": "MED",
+                "severity": "LOW",
                 "confidence": "medium",
-                "report_priority": 58,
+                "report_priority": 35,
                 "reachability": (
                     "Likely reachable only from packets supplied by an Oracle listener/server or a network attacker able to tamper with SQL*Net traffic. "
                     "The PoCs are very short synthetic packets, so confirm against the real session state machine before treating as security."
@@ -292,7 +394,7 @@ def node_oracledb_assessment(meta: dict, top_frame: str, output: str) -> dict:
                 "impact": "harness-amplified",
                 "severity": "LOW",
                 "confidence": "medium",
-                "report_priority": 35,
+                "report_priority": 15,
                 "reachability": (
                     "Lower confidence: the harness calls send-path helpers after constructing a packet from arbitrary bytes. "
                     "This may not correspond to a real product receive path."
@@ -308,16 +410,151 @@ def node_oracledb_assessment(meta: dict, top_frame: str, output: str) -> dict:
     return assessment
 
 
-def target_assessment(target_dir: Path, meta: dict, top_frame: str, output: str, fallback_severity: str, fallback_action: str) -> dict:
+def jsc_assessment(meta: dict, top_frame: str, output: str, fallback_severity: str, fallback_action: str) -> dict:
+    blob = f"{top_frame}\n{output}"
+    if fallback_action == "investigate if repeatable outside timeout":
+        return {
+            "issue_class": "jsc-asan-timeout",
+            "surface": "JavaScriptCore JIT/runtime",
+            "impact": "unconfirmed-under-asan",
+            "severity": "LOW",
+            "confidence": "medium",
+            "report_priority": 20,
+            "triage_verdict": (
+                "ASan replay hit the timeout before confirming the original crash. "
+                "The stored triage frame remains useful context, but this replay did not produce an ASan or assertion signal."
+            ),
+            "reachability": "Reached by the Fuzzilli-generated JavaScript PoC, but not confirmed within the ASan replay timeout.",
+            "harness_notes": (
+                "ASan JSC is much slower than the discovery shell. Increase the replay timeout or reduce the PoC further before treating this as confirmed."
+            ),
+            "recommended_action": fallback_action,
+        }
+
+    asan_match = ASAN_ERROR_RE.search(blob)
+    if asan_match:
+        return {
+            "issue_class": f"jsc-asan-{asan_match.group(1).lower()}",
+            "surface": "JavaScriptCore JIT/runtime",
+            "impact": "potential-memory-corruption",
+            "severity": "HIGH",
+            "confidence": "high",
+            "report_priority": 94,
+            "triage_verdict": (
+                "ASan reported a native memory-safety violation during JavaScript replay. "
+                "Treat this as a security-relevant memory corruption candidate."
+            ),
+            "reachability": "Reached by a Fuzzilli-generated JavaScript PoC under the JSC shell and recorded JIT flags.",
+            "harness_notes": (
+                "Replay uses JSC's recorded Fuzzilli processArguments minus --reprl. "
+                "ASan is halting; UBSan is non-halting and redirected off stderr because this WebKit/libpas build emits startup UBSan noise. "
+                "Confirm on a fresh WebKit checkout before filing."
+            ),
+            "recommended_action": "file-upstream",
+        }
+    if "UndefinedBehaviorSanitizer" in blob or "runtime error:" in blob:
+        return {
+            "issue_class": "jsc-ubsan",
+            "surface": "JavaScriptCore JIT/runtime",
+            "impact": "undefined-behavior",
+            "severity": "LOW",
+            "confidence": "high",
+            "report_priority": 25,
+            "triage_verdict": (
+                "UBSan reported undefined behavior during JavaScript replay. "
+                "This is useful correctness signal, but it is not treated as a manual-review security finding without ASan/native memory-corruption evidence."
+            ),
+            "reachability": "Reached by a Fuzzilli-generated JavaScript PoC under the JSC shell and recorded JIT flags.",
+            "harness_notes": "UBSan evidence is not automatically memory corruption; inspect the specific runtime error.",
+            "recommended_action": "monitor unless linked to memory corruption",
+        }
+
+    frame = top_frame or ""
+    if "FTL" in frame or "DFG" in frame or "ASSERTION FAILED" in blob or "SHOULD NEVER BE REACHED" in blob:
+        tier = "ftl" if "FTL" in frame or "FTL" in blob else "dfg" if "DFG" in frame or "DFG" in blob else "jit"
+        return {
+            "issue_class": f"jsc-{tier}-assertion",
+            "surface": "JavaScriptCore JIT/runtime",
+            "impact": "process-abort-dos",
+            "severity": "LOW",
+            "confidence": "high",
+            "report_priority": 25,
+            "triage_verdict": (
+                "Reproducible JavaScriptCore internal assertion/process abort. "
+                "No ASan/UBSan memory-safety report was observed in this replay."
+            ),
+            "reachability": "Reached by a Fuzzilli-generated JavaScript PoC under the JSC shell and recorded JIT flags.",
+            "harness_notes": (
+                "This is an engine correctness/DoS finding unless an ASan or release replay shows memory corruption past the assertion."
+            ),
+            "recommended_action": "defer unless release/ASan replay shows memory corruption",
+        }
+
+    return {
+        "issue_class": "jsc-crash",
+        "surface": "JavaScriptCore",
+        "impact": "unknown",
+        "severity": fallback_severity,
+        "confidence": "medium",
+        "report_priority": 45,
+        "triage_verdict": "JSC replay crashed without sanitizer-specific classification.",
+        "reachability": "Reached by a Fuzzilli-generated JavaScript PoC.",
+        "harness_notes": "Inspect the replay output and consider rerunning with an ASan JSC binary.",
+        "recommended_action": fallback_action,
+    }
+
+
+def target_assessment(target_dir: Path, meta: dict, top_frame: str, output: str, klass: str, fallback_severity: str, fallback_action: str) -> dict:
     if target_dir.name == "node-oracledb" or meta.get("target_kind") == "node-oracledb-thin-js":
         return node_oracledb_assessment(meta, top_frame, output)
+    if is_jsc_target(target_dir, meta):
+        return jsc_assessment(meta, top_frame, output, fallback_severity, fallback_action)
+    if klass == "memory-bug":
+        return {
+            "issue_class": "generic-asan-memory-bug",
+            "surface": "target harness",
+            "impact": "potential-memory-corruption",
+            "severity": "HIGH",
+            "confidence": "high",
+            "report_priority": 90,
+            "triage_verdict": "ASan/native replay reported a memory-safety violation.",
+            "reachability": "Reached by the target harness; confirm against a fresh upstream build before filing.",
+            "harness_notes": "Generic target profile; inspect the sanitizer stack and source context for harness artifacts.",
+            "recommended_action": "file-upstream",
+        }
+    if klass == "segv":
+        return {
+            "issue_class": "generic-segv",
+            "surface": "target harness",
+            "impact": "potential-memory-corruption",
+            "severity": "HIGH",
+            "confidence": "medium",
+            "report_priority": 82,
+            "triage_verdict": "Replay produced a segmentation fault without a more specific sanitizer class.",
+            "reachability": "Reached by the target harness; rerun with ASan if possible before filing.",
+            "harness_notes": "Generic target profile; prioritize this only if ASan or a release build reproduces cleanly.",
+            "recommended_action": "verify with ASan, then file upstream if confirmed",
+        }
+    if klass in {"ubsan", "assertion"}:
+        return {
+            "issue_class": f"generic-{klass}",
+            "surface": "target harness",
+            "impact": "correctness-or-dos",
+            "severity": "LOW",
+            "confidence": "medium",
+            "report_priority": 25,
+            "triage_verdict": "Replay reproduced a non-memory-corruption signal.",
+            "reachability": "Reached by the target harness, but not elevated for manual security triage.",
+            "harness_notes": "Keep the artifact for trend/corpus value; prioritize only if memory corruption appears in a sanitized replay.",
+            "recommended_action": "monitor unless linked to memory corruption",
+        }
     return {
         "issue_class": "generic-crash",
         "surface": "target harness",
         "impact": "unknown",
         "severity": fallback_severity,
         "confidence": "medium",
-        "report_priority": 55 if fallback_action == "file-upstream" else 45,
+        "report_priority": 45,
         "triage_verdict": "Generic crash classification; inspect sanitizer output and source context.",
         "reachability": "Unknown from generic harness metadata.",
         "harness_notes": "No target-specific assessment is available.",
@@ -327,10 +564,48 @@ def target_assessment(target_dir: Path, meta: dict, top_frame: str, output: str,
 
 def poc_script(target_dir: Path, crash_dir: Path, command: str, meta: dict) -> str:
     target = target_dir.name
-    poc = first_existing([crash_dir / "poc.bin", crash_dir / "poc.pdf", crash_dir / "poc.original.bin", crash_dir / "poc.original.pdf"])
+    if is_jsc_target(target_dir, meta):
+        poc = first_existing([crash_dir / "poc.reduced.js", crash_dir / "poc.js"])
+    else:
+        poc = first_existing([crash_dir / "poc.bin", crash_dir / "poc.pdf", crash_dir / "poc.original.bin", crash_dir / "poc.original.pdf"])
     poc_name = poc.name if poc else "poc.bin"
     sha = sha256_file(poc) if poc else "?"
     size = poc.stat().st_size if poc and poc.exists() else 0
+    if is_jsc_target(target_dir, meta):
+        embed_max = int(os.environ.get("FUZZ_DIGEST_POC_EMBED_MAX", "262144"))
+        js = read_text(poc) if poc else ""
+        truncated = len(js.encode(errors="replace")) > embed_max
+        if truncated:
+            js = js.encode(errors="replace")[:embed_max].decode(errors="replace")
+        note = "JavaScript replay for the JSC/Fuzzilli target."
+        trunc_note = "\n\nPoC preview is truncated; use the artifact path in the replay command for the exact input." if truncated else ""
+        return f"""---
+generated_at: {iso_now()}
+target: {target}
+hash: {crash_dir.name}
+poc_file: {poc_name}
+poc_size: {size}
+poc_sha256: {sha}
+---
+
+# PoC / Reproducer
+
+{note}{trunc_note}
+
+## JavaScript
+
+```js
+{js.rstrip()}
+```
+
+## Shell Replay
+
+```sh
+{command}
+```
+
+PoC artifact: `{poc_name}` ({size} bytes, sha256 `{sha}`).
+"""
     if target == "node-oracledb" or meta.get("target_kind") == "node-oracledb-thin-js":
         mode_set = str(meta.get("fuzz_mode_set") or "").strip()
         mode_export = f'export FUZZ_MODE_SET="${{FUZZ_MODE_SET:-{mode_set}}}"\n' if mode_set else ""
@@ -382,7 +657,7 @@ def write_artifacts(target_dir: Path, crash_dir: Path, command: str, rc: int, ou
     hit_count = int(meta.get("hit_count") or 0)
     when = iso_now()
     out_excerpt = excerpt(output)
-    assessment = target_assessment(target_dir, meta, str(top_frame), output, severity, action)
+    assessment = target_assessment(target_dir, meta, str(top_frame), output, klass, severity, action)
     severity = str(assessment.get("severity") or severity)
     action = str(assessment.get("recommended_action") or action)
     report_priority = int(assessment.get("report_priority") or 0)
