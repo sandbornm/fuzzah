@@ -111,38 +111,53 @@ Two paths. Pick the one that matches your host.
 **Prereq:** [Orbstack](https://orbstack.dev/) installed (`brew install --cask orbstack`).
 
 ```sh
-# 1. Clone
-git clone https://github.com/sandbornm/fuzzah.git && cd fuzzah
+# 1. Clone. You can clone anywhere, but ~/fuzzig/fuzzah matches the
+#    operator layout used by the local docs and agent instructions.
+mkdir -p ~/fuzzig
+cd ~/fuzzig
+git clone https://github.com/sandbornm/fuzzah.git
+cd fuzzah
 
-# 2. Create a Linux VM named `fuzzer` (10 cores / 8 GB — see "Sizing" below)
-orb create ubuntu:22.04 fuzzer --cpu 10 --memory 8 --user "$USER"
+# 2. Create/reuse the OrbStack VM, install packages, build AFL++, install
+#    shared scripts, enable the watchdog, and run smoke checks.
+bash shared/setup-macos-orb.sh
 
-# 3. Install AFL++ and build deps inside the VM
-orb -m fuzzer bash -c '
-  sudo apt-get update && sudo apt-get install -y \
-    build-essential clang llvm lld cmake git python3 python3-dev \
-    automake libtool pkg-config libglib2.0-dev bison flex gdb jq \
-    nftables tmux
-  mkdir -p $HOME/fuzzing/tools && cd $HOME/fuzzing/tools
-  git clone --depth 1 https://github.com/AFLplusplus/AFLplusplus.git
-  cd AFLplusplus && make distrib -j$(nproc)
-'
-
-# 4. Install the shared infrastructure (watchdog, check-in, rig-check)
-orb -m fuzzer bash -c '
-  mkdir -p $HOME/fuzzig-shared $HOME/fuzzing/logs $HOME/.config/systemd/user
-  cp '"$PWD"'/shared/{check-in,rig-check,fuzz-watchdog}.sh $HOME/fuzzig-shared/
-  chmod +x $HOME/fuzzig-shared/*.sh
-  cp '"$PWD"'/shared/fuzz-watchdog.{service,timer} $HOME/.config/systemd/user/
-  systemctl --user daemon-reload
-  systemctl --user enable --now fuzz-watchdog.timer
-'
-
-# 5. Smoke test
+# 3. Health check.
 bash shared/rig-check.sh
 ```
 
 Done. `rig-check` will report "no targets yet" until you add one (next section).
+
+For a brand-new node where you have not cloned the repo yet, the setup script
+can bootstrap the checkout first:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/sandbornm/fuzzah/main/shared/setup-macos-orb.sh \
+  -o /tmp/setup-macos-orb.sh
+bash /tmp/setup-macos-orb.sh
+```
+
+That clones `fuzzah` into `~/fuzzig/fuzzah` by default, then re-execs the repo
+copy of the script.
+
+The script defaults to a VM named `fuzzer`, Ubuntu 24.04, 10 CPUs, 8 GB RAM,
+and a 256 GB disk cap. Override these with flags:
+
+```sh
+bash shared/setup-macos-orb.sh \
+  --vm-name fuzzer \
+  --distro ubuntu:24.04 \
+  --cpus 10 \
+  --memory 8G \
+  --disk 256G \
+  --user "$USER"
+```
+
+If you create the VM manually, use OrbStack's plural flag names:
+
+```sh
+orb create --cpus 10 --memory 8G --disk 256G --user "$USER" ubuntu:24.04 fuzzer
+```
 
 For any command that should run on the fuzz host, prefer:
 
@@ -414,6 +429,10 @@ bash shared/crash-digest/send-digest.sh
 It runs a bounded raw-crash triage pass, promotes a small number of high-signal
 clusters into reproducible `REPORT.md`/`REPRO.md`/`POC.md` artifacts, collects
 live state, then sends a Resend email with direct dashboard links.
+By default, the email top list is stricter than the dashboard: it requires
+`FUZZ_DIGEST_MIN_REPORT_PRIORITY=80` and `FUZZ_DIGEST_ONLY_HIGH_VALUE=1`, so
+assertions, UBSan-only reports, JavaScript exceptions, and parser DoS stay
+visible in the dashboard without being flagged for manual security triage.
 
 Dry-run first:
 
