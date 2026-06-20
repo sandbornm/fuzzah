@@ -121,6 +121,34 @@ wait_for_vm() {
   return 1
 }
 
+orb_machine_exists() {
+  command -v orbctl >/dev/null 2>&1 || return 1
+  orbctl list --quiet 2>/dev/null | grep -Fxq "$VM_NAME"
+}
+
+try_start_vm() {
+  command -v orbctl >/dev/null 2>&1 || return 1
+  orbctl start "$VM_NAME" >/dev/null 2>&1
+}
+
+print_orb_recovery_hint() {
+  cat >&2 <<EOF
+
+[!] OrbStack could not start VM '$VM_NAME' reliably.
+    On the new Mac, run:
+
+      orbctl status
+      orbctl list
+      orbctl start $VM_NAME
+      orb -m $VM_NAME true
+
+    If those still time out, fully quit and relaunch OrbStack, then rerun:
+
+      bash shared/setup-macos-orb.sh --skip-create
+
+EOF
+}
+
 require_macos_orb() {
   [[ "$(uname -s)" == "Darwin" ]] || die "setup-macos-orb.sh must run on macOS"
   command -v orb >/dev/null 2>&1 || die "missing orb CLI; install OrbStack first"
@@ -132,7 +160,19 @@ create_or_reuse_vm() {
     return 0
   fi
 
+  if orb_machine_exists; then
+    echo "[*] OrbStack VM '$VM_NAME' exists but is not reachable; trying to start it"
+    try_start_vm || true
+    if wait_for_vm 60; then
+      echo "[+] started existing OrbStack VM: $VM_NAME"
+      return 0
+    fi
+    print_orb_recovery_hint
+    die "VM '$VM_NAME' exists but did not become reachable"
+  fi
+
   if (( SKIP_CREATE )); then
+    print_orb_recovery_hint
     die "VM '$VM_NAME' is not reachable and --skip-create was set"
   fi
 
@@ -144,13 +184,28 @@ create_or_reuse_vm() {
   set -e
   if (( rc != 0 )); then
     printf '%s\n' "$out" >&2
-    if printf '%s\n' "$out" | grep -Eiq 'already exists|exists|duplicate'; then
-      die "VM '$VM_NAME' appears to exist but is not reachable. Fully quit/relaunch OrbStack, then rerun with --skip-create."
+    # OrbStack can create the machine successfully but return a timeout while
+    # starting it. Re-check before failing so the bootstrap remains rerunnable.
+    if wait_for_vm 30; then
+      echo "[+] VM '$VM_NAME' became reachable after create timeout"
+      return 0
     fi
+    if orb_machine_exists; then
+      echo "[*] VM '$VM_NAME' exists after create failure; trying explicit start"
+      try_start_vm || true
+      if wait_for_vm 60; then
+        echo "[+] started OrbStack VM after create failure: $VM_NAME"
+        return 0
+      fi
+    fi
+    print_orb_recovery_hint
     die "orb create failed"
   fi
 
-  wait_for_vm 60 || die "created VM '$VM_NAME' but it did not become reachable"
+  if ! wait_for_vm 60; then
+    try_start_vm || true
+    wait_for_vm 60 || { print_orb_recovery_hint; die "created VM '$VM_NAME' but it did not become reachable"; }
+  fi
 }
 
 install_base_packages() {
