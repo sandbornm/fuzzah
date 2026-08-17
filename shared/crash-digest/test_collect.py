@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import pathlib
 import tempfile
 import unittest
@@ -33,7 +34,7 @@ class HostLaneTests(unittest.TestCase):
             json.dumps(
                 {
                     "engine": "jackalope",
-                    "pid": "4242",
+                    "pid": str(os.getpid()),
                     "alive": True,
                     "execs_per_sec": 20,
                     "execs_done": 24201,
@@ -91,6 +92,22 @@ class HostLaneTests(unittest.TestCase):
             # No AFL-style raw backlog for the digest's triage-drain to chew on.
             self.assertEqual(t["raw_crashes"]["unseen"], 0)
             self.assertEqual(t["roles"][0]["engine"], "jackalope")
+
+    def test_stale_host_alive_flag_requires_live_pid(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d) / "targets"
+            root.mkdir()
+            self._make_imageio(root, with_crash=False)
+            stats_path = root / "imageio" / "findings" / "stats.json"
+            stats = json.loads(stats_path.read_text())
+            stats["pid"] = "999999999"
+            stats_path.write_text(json.dumps(stats))
+
+            target = collect.collect_host_targets(root)[0]
+            self.assertEqual(target["alive_roles"], 0)
+            self.assertEqual(target["execs_per_sec"], 0.0)
+            self.assertFalse(target["roles"][0]["alive"])
+            self.assertEqual(target["roles"][0]["execs_per_sec"], 0.0)
 
     def test_host_target_with_crash(self):
         with tempfile.TemporaryDirectory() as d:

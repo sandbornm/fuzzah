@@ -324,9 +324,11 @@ def collect_host_target(target_dir: Path) -> dict:
     stats = read_json(target_dir / "findings" / "stats.json")
     engine = read_text(target_dir / "engine").strip() or stats.get("engine") or "jackalope"
     crashes, state_counts = collect_host_crashes(target_dir)
-    alive = bool(stats.get("alive"))
+    # stats.json persists across crashes and reboots. Treat its alive bit as a
+    # claim that must be backed by the recorded local PID at collection time.
+    alive = bool(stats.get("alive")) and live_pid(str(stats.get("pid") or ""))
     try:
-        execs_per_sec = float(stats.get("execs_per_sec") or 0)
+        execs_per_sec = float(stats.get("execs_per_sec") or 0) if alive else 0.0
     except (TypeError, ValueError):
         execs_per_sec = 0.0
     try:
@@ -338,7 +340,7 @@ def collect_host_target(target_dir: Path) -> dict:
         "role": engine,
         "engine": engine,
         "alive": alive,
-        "execs_per_sec": stats.get("execs_per_sec"),
+        "execs_per_sec": execs_per_sec,
         "execs_done": stats.get("execs_done"),
         "corpus_count": stats.get("corpus_count"),
         "coverage": stats.get("coverage"),

@@ -41,21 +41,22 @@ print_host_targets_section() {
 
   for tdir in "$hroot"/*/; do
     [[ -d "$tdir" && -f "$tdir/engine" ]] || continue
-    local target stats alive eps corpus cov tcrashes
+    local target stats alive eps corpus cov pid tcrashes
     target="$(basename "$tdir")"
     stats="$tdir/findings/stats.json"
-    alive="no-stats"; eps="0"; corpus="0"; cov="0"
+    alive="no-stats"; eps="0"; corpus="0"; cov="0"; pid=""
     if [[ -s "$stats" ]]; then
       if command -v jq >/dev/null 2>&1; then
         alive="$(jq -r 'if .alive then "yes" else "no" end' "$stats" 2>/dev/null || echo '?')"
         eps="$(jq -r '.execs_per_sec // 0'  "$stats" 2>/dev/null || echo 0)"
         corpus="$(jq -r '.corpus_count // 0' "$stats" 2>/dev/null || echo 0)"
         cov="$(jq -r '.coverage // 0'        "$stats" 2>/dev/null || echo 0)"
+        pid="$(jq -r '.pid // ""'            "$stats" 2>/dev/null || echo '')"
       else
         # python3 fallback (system interpreter; avoids the uv PATH shim).
         local py; py="$(command -v /usr/bin/python3 || command -v python3 || true)"
         if [[ -n "$py" ]]; then
-          read -r alive eps corpus cov < <("$py" - "$stats" <<'PY'
+          read -r alive eps corpus cov pid < <("$py" - "$stats" <<'PY'
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -64,10 +65,19 @@ except Exception:
 print("yes" if d.get("alive") else "no",
       int(d.get("execs_per_sec") or 0),
       int(d.get("corpus_count") or 0),
-      int(d.get("coverage") or 0))
+      int(d.get("coverage") or 0),
+      d.get("pid") or "")
 PY
 )
         fi
+      fi
+      # stats.json is a persisted snapshot. A crash or reboot can leave its
+      # `alive=true` bit behind indefinitely, so verify the recorded PID just
+      # like the AFL lane verifies each fuzzer_pid before reporting it live.
+      if [[ "$alive" == "yes" ]] && \
+         { [[ ! "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; }; then
+        alive="no"
+        eps="0"
       fi
     fi
     tcrashes=0

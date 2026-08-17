@@ -710,6 +710,15 @@ def roles_from_stats_json(s, role_name):
     return [role]
 
 
+def local_pid_alive(pid):
+    """Whether a PID recorded by a host-local engine still exists."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def jackalope_roles_from_stats(stats_path):
     """Read a jackalope findings/stats.json FILE and shape it into the dashboard
     role list (single synthetic 'jackalope' role). Thin file-reading wrapper over
@@ -719,6 +728,11 @@ def jackalope_roles_from_stats(stats_path):
             s = json.load(f)
     except (OSError, ValueError):
         return []
+    # The file survives process exits and reboots. Never trust a persisted
+    # alive=true without rechecking the host PID; suppress stale throughput too.
+    if s.get("alive") and not local_pid_alive(s.get("pid")):
+        s["alive"] = False
+        s["execs_per_sec"] = 0
     return roles_from_stats_json(s, "jackalope")
 
 

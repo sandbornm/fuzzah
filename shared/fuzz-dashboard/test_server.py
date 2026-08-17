@@ -29,6 +29,22 @@ class StateTests(unittest.TestCase):
         self.assertEqual(server.normalize_status("points-to: 4971c05e06c1"), "dup")
         self.assertEqual(server.normalize_status("unexpected-state"), "new")
 
+    def test_jackalope_stale_alive_flag_requires_live_pid(self):
+        with tempfile.TemporaryDirectory() as d:
+            stats = os.path.join(d, "stats.json")
+            with open(stats, "w") as f:
+                json.dump({
+                    "engine": "jackalope",
+                    "pid": "999999999",
+                    "alive": True,
+                    "execs_per_sec": 21,
+                    "updated_at": int(time.time()),
+                }, f)
+
+            role = server.jackalope_roles_from_stats(stats)[0]
+            self.assertFalse(role["alive"])
+            self.assertEqual(role["execs_per_sec"], "0")
+
 
 class ScanTests(unittest.TestCase):
     def test_target_crashes_parses_review_flag(self):
@@ -192,7 +208,7 @@ class LedgerTests(unittest.TestCase):
 
 class JackalopeRolesTests(unittest.TestCase):
     STATS = {
-        "engine": "jackalope", "pid": "23725", "alive": True,
+        "engine": "jackalope", "pid": str(os.getpid()), "alive": True,
         "execs_per_sec": 280, "execs_done": 392097, "corpus_count": 316,
         "coverage": 23874, "saved_crashes": 4, "last_find": 1781293714,
         "start_time": 1781282475, "updated_at": 1781293867,
@@ -219,8 +235,8 @@ class JackalopeRolesTests(unittest.TestCase):
         self.assertEqual(r["bitmap_cvg"], "23874")   # coverage offsets -> bitmap_cvg
         self.assertEqual(r["saved_crashes"], "4")
         self.assertEqual(r["unique_crashes"], "4")
-        self.assertEqual(r["pid"], "23725")
-        self.assertEqual(r["fuzzer_pid"], "23725")
+        self.assertEqual(r["pid"], str(os.getpid()))
+        self.assertEqual(r["fuzzer_pid"], str(os.getpid()))
         # no-analogue fields default to "0"
         self.assertEqual(r["pending_total"], "0")
         self.assertEqual(r["pending_favs"], "0")
