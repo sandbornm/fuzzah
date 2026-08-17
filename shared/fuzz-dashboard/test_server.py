@@ -25,6 +25,10 @@ class StateTests(unittest.TestCase):
         self.assertEqual(server.normalize_status("review-requested note"), "review-requested")
         self.assertEqual(server.normalize_status(""), "new")
 
+    def test_normalize_status_maps_legacy_points_to_to_dup(self):
+        self.assertEqual(server.normalize_status("points-to: 4971c05e06c1"), "dup")
+        self.assertEqual(server.normalize_status("unexpected-state"), "new")
+
 
 class ScanTests(unittest.TestCase):
     def test_target_crashes_parses_review_flag(self):
@@ -119,6 +123,54 @@ class ViabilityTests(unittest.TestCase):
         self.assertEqual(bucket, "high")
         self.assertEqual(score, 86)
         self.assertIn("oson-recursion-dos", reason)
+
+
+class FindingsSummaryTests(unittest.TestCase):
+    def test_fuzzilli_summary_separates_raw_and_triaged_counts(self):
+        old = (server.list_host_targets, server.vm_target_engine,
+               server._vm_fuzzilli_raw_counts)
+        try:
+            server.CACHE.invalidate()
+            server.list_host_targets = lambda: []
+            server.vm_target_engine = lambda target: "fuzzilli"
+            server._vm_fuzzilli_raw_counts = lambda target: {
+                "raw_unique": 129,
+                "raw_duplicates": 42,
+                "raw_seen": 129,
+            }
+            roles = [{"saved_crashes": "129"}]
+            crashes = [
+                {"status": "repro-ok"},
+                {"status": "repro-ok"},
+                {"status": "new"},
+            ]
+            summary = server.target_findings_summary("jsc", roles, crashes)
+        finally:
+            (server.list_host_targets, server.vm_target_engine,
+             server._vm_fuzzilli_raw_counts) = old
+            server.CACHE.invalidate()
+
+        self.assertEqual(summary["engine"], "fuzzilli")
+        self.assertEqual(summary["raw_unique"], 129)
+        self.assertEqual(summary["raw_duplicates"], 42)
+        self.assertEqual(summary["raw_seen"], 129)
+        self.assertEqual(summary["triaged"], 3)
+        self.assertEqual(summary["needs_review"], 1)
+        self.assertEqual(summary["repro_ok"], 2)
+
+    def test_findings_summary_render_names_report_families(self):
+        html = server.render_findings_summary({
+            "engine": "fuzzilli",
+            "raw_unique": 129,
+            "raw_duplicates": 42,
+            "raw_seen": 129,
+            "triaged": 3,
+            "needs_review": 0,
+            "repro_ok": 3,
+            "reported": 0,
+        })
+        self.assertIn("raw unique", html)
+        self.assertIn("report families", html)
 
 
 class LedgerTests(unittest.TestCase):

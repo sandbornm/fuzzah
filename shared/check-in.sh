@@ -72,7 +72,13 @@ PY
     fi
     tcrashes=0
     if [[ -d "$tdir/crashes-triaged" ]]; then
-      tcrashes="$(find "$tdir/crashes-triaged" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+      local cdir cname
+      for cdir in "$tdir/crashes-triaged"/*; do
+        [[ -d "$cdir" ]] || continue
+        cname="$(basename "$cdir")"
+        [[ "$cname" =~ ^[0-9a-f]{12}$ ]] || continue
+        tcrashes=$((tcrashes + 1))
+      done
     fi
     printf '%-12s %-7s %-9s %-9s %-10s %-9s\n' \
       "$target" "$alive" "$eps" "$corpus" "$cov" "$tcrashes"
@@ -100,6 +106,30 @@ declare -A STATE_CRASHES  # "state|target|hash|top_frame|first_seen|hit" lines, 
 total_targets=0
 total_crashes=0
 declare -A COUNT_BY_STATE
+
+is_crash_hash() {
+  [[ "${1:-}" =~ ^[0-9a-f]{12}$ ]]
+}
+
+normalize_status() {
+  local s="${1:-}"
+  s="${s//$'\r'/ }"
+  # shellcheck disable=SC2086 # intentional: split status text on whitespace
+  set -- $s
+  s="${1:-new}"
+  case "$s" in
+    new|review-requested|reviewed|repro-ok|reported|dup|ignore)
+      printf '%s' "$s"
+      ;;
+    points-to:*)
+      # Legacy dedup marker written by older triage helpers.
+      printf 'dup'
+      ;;
+    *)
+      printf 'new'
+      ;;
+  esac
+}
 
 # Header
 echo "=== Fuzz check-in @ $(date +'%Y-%m-%d %H:%M:%S') ==="
@@ -197,16 +227,20 @@ PY
   n_crashes=0; n_new=0; n_rev=0; n_repro=0; n_done=0
   if [[ -d "$triage_dir" ]]; then
     while IFS= read -r -d '' cd; do
+      hash="$(basename "$cd")"
+      is_crash_hash "$hash" || continue
       n_crashes=$((n_crashes + 1))
       status="new"
-      [[ -s "$cd/.status" ]] && status="$(head -n1 "$cd/.status" | tr -d '[:space:]')"
-      hash="$(basename "$cd")"
+      [[ -s "$cd/.status" ]] && status="$(normalize_status "$(cat "$cd/.status")")"
       top="?"; seen="?"; hit="?"
       if [[ -s "$cd/meta.json" ]] && command -v jq >/dev/null; then
         top="$(jq -r '.top_frame // "?"'   "$cd/meta.json" 2>/dev/null)"
         seen="$(jq -r '.first_seen // "?"' "$cd/meta.json" 2>/dev/null)"
         hit="$(jq -r '.hit_count // 0'     "$cd/meta.json" 2>/dev/null)"
       fi
+      top="${top//$'\t'/ }"; top="${top//$'\n'/ }"
+      seen="${seen//$'\t'/ }"; seen="${seen//$'\n'/ }"
+      hit="${hit//$'\t'/ }"; hit="${hit//$'\n'/ }"
       case "$status" in
         new)         n_new=$((n_new + 1)) ;;
         reviewed)    n_rev=$((n_rev + 1)) ;;
@@ -216,9 +250,10 @@ PY
         *)           n_new=$((n_new + 1)) ;;  # unknown → treat as new
       esac
       COUNT_BY_STATE[$status]=$(( ${COUNT_BY_STATE[$status]:-0} + 1 ))
-      # Accumulate for later per-state listing. Pipe-delimited, skip 'done' states.
+      # Accumulate for later per-state listing. Tab-delimited, skip done states.
+      # Top frames can contain pipes (for example C/JS assertions with "||").
       if [[ "$status" != "reported" && "$status" != "dup" && "$status" != "ignore" ]]; then
-        STATE_CRASHES[$status]+="$target|$hash|$top|$seen|$hit"$'\n'
+        STATE_CRASHES[$status]+="$target"$'\t'"$hash"$'\t'"$top"$'\t'"$seen"$'\t'"$hit"$'\n'
       fi
     done < <(find "$triage_dir" -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null)
   fi
@@ -235,7 +270,7 @@ render_state() {
   local state="$1"
   local blob="${STATE_CRASHES[$state]:-}"
   [[ -z "$blob" ]] && { echo "  (none)"; return; }
-  echo "$blob" | awk -F'|' 'NF>=5 {
+  echo "$blob" | awk -F'\t' 'NF>=5 {
     printf "  %-8s %-14s %-40s  hits=%s  seen=%s\n", $1, $2, substr($3,1,40), $5, $4
   }'
 }

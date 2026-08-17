@@ -17,6 +17,10 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(collect.normalize_status("repro-ok extra"), "repro-ok")
         self.assertEqual(collect.normalize_status(""), "new")
 
+    def test_status_maps_legacy_points_to_to_dup(self):
+        self.assertEqual(collect.normalize_status("points-to: 4971c05e06c1"), "dup")
+        self.assertEqual(collect.normalize_status("bogus"), "new")
+
 
 class HostLaneTests(unittest.TestCase):
     """The macOS host (jackalope) lane read from the local filesystem."""

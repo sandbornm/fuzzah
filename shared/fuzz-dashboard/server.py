@@ -171,6 +171,7 @@ def host_health():
             eps = sum(float(r['execs_per_sec'] or 0) for r in roles if r['alive'])
             crashes = max((int(r['unique_crashes']) for r in roles if r['unique_crashes'].isdigit()), default=0)
             summary["by_target"][t] = {
+                "engine": "fuzzilli",
                 "alive": alive, "calibrating": 0, "proc": alive,
                 "execs_per_sec": eps, "crashes": crashes, "roles_seen": len(roles),
             }
@@ -185,6 +186,7 @@ def host_health():
         proc = target_proc_count(t)
         calibrating = max(0, proc - alive)
         summary["by_target"][t] = {
+            "engine": "afl",
             "alive": alive, "calibrating": calibrating,
             "proc": proc, "execs_per_sec": eps, "crashes": crashes,
             "roles_seen": len(roles),
@@ -204,6 +206,7 @@ def host_health():
         eps = sum(float(r['execs_per_sec'] or 0) for r in roles if r['alive'])
         crashes = max((int(r['unique_crashes']) for r in roles if r['unique_crashes'].isdigit()), default=0)
         summary["by_target"][t] = {
+            "engine": "jackalope",
             "alive": alive, "calibrating": 0, "proc": alive,
             "execs_per_sec": eps, "crashes": crashes, "roles_seen": len(roles),
         }
@@ -460,7 +463,12 @@ def fmt_int(n):
 
 def normalize_status(text):
     parts = (text or "").strip().split()
-    return parts[0] if parts else "new"
+    if not parts:
+        return "new"
+    status = parts[0]
+    if status.startswith("points-to:"):
+        return "dup"
+    return status if status in VALID_STATES else "new"
 
 
 # One python3 process walks every crash dir and emits the table — vs the old
@@ -472,7 +480,15 @@ pat = re.compile(r'^[0-9a-f]{12}$')
 
 def normalize_status(text):
     parts = (text or '').strip().split()
-    return parts[0] if parts else 'new'
+    if not parts:
+        return 'new'
+    status = parts[0]
+    if status.startswith('points-to:'):
+        return 'dup'
+    return status if status in {
+        'new', 'review-requested', 'reviewed', 'repro-ok',
+        'reported', 'dup', 'ignore',
+    } else 'new'
 
 def read_report_meta(path):
     try:
@@ -1332,6 +1348,121 @@ def aggregate_kpis(health):
     return k
 
 
+def _int_value(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _status_counts(crashes):
+    counts = {}
+    for c in crashes:
+        status = normalize_status(c.get("status"))
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _vm_fuzzilli_raw_counts(target):
+    """Raw Fuzzilli finding counts that do not exist in REPORT/crash rows.
+
+    stats.json carries the unique raw crash count, but the operator also needs
+    duplicate and triage-seen counts to understand why a target can have many
+    raw Fuzzilli crashes but only a few report families.
+    """
+    if not re.match(r'^[a-zA-Z0-9_-]+$', target):
+        return {}
+    cmd = (
+        f'T="$HOME/fuzzing/targets/{shlex.quote(target)}"; python3 - "$T" <<\'PY\'\n'
+        'import json, pathlib, sys\n'
+        't = pathlib.Path(sys.argv[1])\n'
+        'crashes = t / "findings" / "crashes"\n'
+        'seen = t / "logs" / "triage-seen.txt"\n'
+        'def count_js(path):\n'
+        '    try:\n'
+        '        return sum(1 for p in path.iterdir() if p.is_file() and p.suffix == ".js")\n'
+        '    except OSError:\n'
+        '        return 0\n'
+        'try:\n'
+        '    seen_count = len(seen.read_text(errors="replace").splitlines())\n'
+        'except OSError:\n'
+        '    seen_count = 0\n'
+        'print(json.dumps({\n'
+        '    "raw_unique": count_js(crashes),\n'
+        '    "raw_duplicates": count_js(crashes / "duplicates"),\n'
+        '    "raw_seen": seen_count,\n'
+        '}))\n'
+        'PY'
+    )
+    out, _, rc = run_on_host(cmd, timeout=12)
+    if rc != 0 or not out:
+        return {}
+    try:
+        data = json.loads(out.strip().splitlines()[-1])
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        return {}
+
+
+def target_findings_summary(target, roles, crashes):
+    """Normalize raw engine findings vs triaged report families for display."""
+    if is_host_target(target):
+        engine = "jackalope"
+    else:
+        engine = vm_target_engine(target)
+    raw_saved = sum(_int_value(r.get("saved_crashes")) for r in roles)
+    counts = _status_counts(crashes)
+    triaged = len(crashes)
+    summary = {
+        "engine": engine,
+        "raw_saved": raw_saved,
+        "raw_unique": raw_saved,
+        "raw_duplicates": None,
+        "raw_seen": None,
+        "triaged": triaged,
+        "needs_review": sum(counts.get(s, 0) for s in ("new", "review-requested", "reviewed")),
+        "repro_ok": counts.get("repro-ok", 0),
+        "reported": counts.get("reported", 0),
+        "parked": counts.get("dup", 0) + counts.get("ignore", 0),
+    }
+    if engine == "fuzzilli":
+        raw = CACHE.get(f"fuzzilli_raw:{target}", 30, lambda: _vm_fuzzilli_raw_counts(target))
+        if raw:
+            summary["raw_unique"] = _int_value(raw.get("raw_unique"), raw_saved)
+            summary["raw_duplicates"] = _int_value(raw.get("raw_duplicates"))
+            summary["raw_seen"] = _int_value(raw.get("raw_seen"))
+    return summary
+
+
+def render_findings_summary(summary):
+    engine = summary.get("engine") or "afl"
+    raw_label = "raw unique" if engine == "fuzzilli" else "raw saved"
+    raw_tip = (
+        "Raw Fuzzilli crash programs in findings/crashes/*.js before replay "
+        "dedupes them into report families."
+        if engine == "fuzzilli"
+        else "Raw engine/AFL saved crash count before report-family deduplication."
+    )
+    cards = [
+        f'<div class="kpi"><div class="label" title="{html.escape(raw_tip, quote=True)}">{html.escape(raw_label)}</div><div class="value">{fmt_int(summary.get("raw_unique", 0))}</div><div class="sub">{html.escape(engine)}</div></div>',
+    ]
+    if summary.get("raw_duplicates") is not None:
+        cards.append(
+            f'<div class="kpi"><div class="label" title="Raw duplicate Fuzzilli crash programs stored under findings/crashes/duplicates.">raw duplicates</div><div class="value">{fmt_int(summary.get("raw_duplicates", 0))}</div><div class="sub">engine-side</div></div>'
+        )
+    if summary.get("raw_seen") is not None:
+        cards.append(
+            f'<div class="kpi"><div class="label" title="Raw Fuzzilli crash programs already replayed by the triage timer.">raw seen</div><div class="value">{fmt_int(summary.get("raw_seen", 0))}</div><div class="sub">triage drain</div></div>'
+        )
+    cards.extend([
+        f'<div class="kpi"><div class="label" title="Deduped crash dirs under crashes-triaged/<hash>, after replay and stack/assertion fingerprinting.">report families</div><div class="value">{fmt_int(summary.get("triaged", 0))}</div><div class="sub">deduped</div></div>',
+        f'<div class="kpi {"warn" if summary.get("needs_review", 0) else ""}"><div class="label" title="Families still in new, review-requested, or reviewed state.">needs review</div><div class="value">{fmt_int(summary.get("needs_review", 0))}</div><div class="sub">operator queue</div></div>',
+        f'<div class="kpi"><div class="label" title="Families that reproduced and have generated report/PoC material.">repro-ok</div><div class="value">{fmt_int(summary.get("repro_ok", 0))}</div><div class="sub">report-ready</div></div>',
+        f'<div class="kpi"><div class="label" title="Families already reported upstream.">reported</div><div class="value">{fmt_int(summary.get("reported", 0))}</div><div class="sub">tracking</div></div>',
+    ])
+    return f'<div class="kpis">{"".join(cards)}</div>'
+
+
 def render_kpis(kpis, scope="global"):
     """Render KPI card row. scope='global' for index, 'target' for per-target."""
     live_cls = "live" if kpis["live_roles"] > 0 else "dead"
@@ -1385,12 +1516,13 @@ def render_index():
             dot, state = '<span class="warn">●</span>', f"{info['proc']} proc, stale stats"
         else:
             dot, state = '<span class="dead">●</span>', "idle"
+        crash_label = "raw crashes" if info.get("engine") == "fuzzilli" else "crashes"
         target_rows.append(
             f'<tr data-target="{html.escape(t, quote=True)}">'
             f'<td data-field="dot">{dot}</td>'
             f'<td><a href="/t/{html.escape(t)}/">{html.escape(t)}</a></td>'
             f'<td data-field="state">{state}</td>'
-            f'<td class="muted"><span data-field="crashes">{info["crashes"]}</span> crashes</td></tr>'
+            f'<td class="muted"><span data-field="crashes">{info["crashes"]}</span> {html.escape(crash_label)}</td></tr>'
         )
 
     check_in = CACHE.get("check_in", 15, fetch_check_in)
@@ -1449,6 +1581,8 @@ def render_target(target):
         "min_last_find_s": min(last_finds) if last_finds else None,
     }
     kpi_block = render_kpis(kpis, scope="target")
+    findings_summary = target_findings_summary(target, roles, crashes)
+    findings_block = render_findings_summary(findings_summary)
 
     # Role table
     role_rows = []
@@ -1542,6 +1676,8 @@ def render_target(target):
     body = f"""
 <h1>{html.escape(target)}</h1>
 {kpi_block}
+<h2>findings</h2>
+{findings_block}
 <h2>roles</h2>
 <table>
 <tr>
@@ -1552,14 +1688,14 @@ def render_target(target):
 <th title="Edge-coverage bitmap fill — how much of the instrumented map this worker has reached.">cvg</th>
 <th title="Inputs kept in this worker's corpus (interesting/coverage-increasing test cases).">corpus</th>
 <th title="Queue entries not yet fuzzed: total, and favored (the smaller high-value subset AFL prioritizes).">pending</th>
-<th title="Unique crashes saved by this worker (AFL's own count, before cross-worker dedup).">crashes</th>
+<th title="Raw crashes saved by this role before triage/report-family dedup. For Fuzzilli, this is findings/crashes/*.js.">raw crashes</th>
 <th title="Time since this worker last discovered a new coverage path. Long gaps (hours) suggest it has plateaued.">last find</th>
 <th title="Age of this worker's fuzzer_stats file. If it stops advancing, the worker has stalled or died.">stats age</th>
 </tr>
 {''.join(role_rows) or '<tr><td colspan=10 class="muted">no roles</td></tr>'}
 </table>
 {fam_html}
-<h2>crashes ({len(crashes)})</h2>
+<h2>triaged crash families ({len(crashes)})</h2>
 <p>{bucket_html}</p>
 <div class="filter-bar">
   filter status: <select id="fstatus" onchange="filterCrashes()">

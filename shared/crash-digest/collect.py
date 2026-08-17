@@ -84,7 +84,13 @@ def read_json(path: Path) -> dict:
 
 def normalize_status(text: str) -> str:
     parts = (text or "").strip().split()
-    return parts[0] if parts else "new"
+    if not parts:
+        return "new"
+    status = parts[0]
+    if status.startswith("points-to:"):
+        return "dup"
+    valid = {"new", "review-requested", "reviewed", "repro-ok", "reported", "dup", "ignore"}
+    return status if status in valid else "new"
 
 
 def parse_frontmatter(text: str) -> dict:

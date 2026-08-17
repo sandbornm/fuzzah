@@ -19,6 +19,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 VM_NAME="${ORB_VM:-fuzzer}"
 DISTRO="${FUZZAH_ORB_DISTRO:-ubuntu:24.04}"
+ARCH="${FUZZAH_ORB_ARCH:-arm64}"
 CPUS="${FUZZAH_ORB_CPUS:-10}"
 MEMORY="${FUZZAH_ORB_MEMORY:-8G}"
 DISK="${FUZZAH_ORB_DISK:-256G}"
@@ -54,6 +55,7 @@ Bootstraps the base fuzzah runtime on a macOS host with OrbStack.
 Options:
   --vm-name NAME     OrbStack machine name (default: $VM_NAME)
   --distro DISTRO    OrbStack distro image (default: $DISTRO)
+  --arch ARCH        VM CPU architecture (default: $ARCH)
   --cpus N           VM CPU limit (default: $CPUS)
   --memory SIZE      VM memory limit, e.g. 8G (default: $MEMORY)
   --disk SIZE        VM disk limit, e.g. 256G (default: $DISK)
@@ -64,7 +66,8 @@ Options:
 
 Environment overrides:
   ORB_VM, FUZZAH_ORB_DISTRO, FUZZAH_ORB_CPUS, FUZZAH_ORB_MEMORY,
-  FUZZAH_ORB_DISK, FUZZAH_ORB_USER, FUZZAH_BOOTSTRAP_ROOT, FUZZAH_REPO_URL
+  FUZZAH_ORB_ARCH, FUZZAH_ORB_DISK, FUZZAH_ORB_USER,
+  FUZZAH_BOOTSTRAP_ROOT, FUZZAH_REPO_URL
 
 Standalone use:
   curl -fsSL https://raw.githubusercontent.com/sandbornm/fuzzah/main/shared/setup-macos-orb.sh \\
@@ -81,6 +84,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm-name) VM_NAME="${2:?missing value for --vm-name}"; shift 2 ;;
     --distro) DISTRO="${2:?missing value for --distro}"; shift 2 ;;
+    --arch) ARCH="${2:?missing value for --arch}"; shift 2 ;;
     --cpus) CPUS="${2:?missing value for --cpus}"; shift 2 ;;
     --memory) MEMORY="${2:?missing value for --memory}"; shift 2 ;;
     --disk) DISK="${2:?missing value for --disk}"; shift 2 ;;
@@ -176,10 +180,10 @@ create_or_reuse_vm() {
     die "VM '$VM_NAME' is not reachable and --skip-create was set"
   fi
 
-  echo "[*] creating OrbStack VM '$VM_NAME' ($DISTRO, cpus=$CPUS, memory=$MEMORY, disk=$DISK, user=$VM_USER)"
+  echo "[*] creating OrbStack VM '$VM_NAME' ($DISTRO, arch=$ARCH, cpus=$CPUS, memory=$MEMORY, disk=$DISK, user=$VM_USER)"
   local out rc
   set +e
-  out="$(orb create --cpus "$CPUS" --memory "$MEMORY" --disk "$DISK" --user "$VM_USER" "$DISTRO" "$VM_NAME" 2>&1)"
+  out="$(orb create --arch "$ARCH" --cpus "$CPUS" --memory "$MEMORY" --disk "$DISK" --user "$VM_USER" "$DISTRO" "$VM_NAME" 2>&1)"
   rc=$?
   set -e
   if (( rc != 0 )); then

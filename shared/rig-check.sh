@@ -29,8 +29,8 @@ fi
 
 if (( IN_VM )); then
   HOST_TAG="vm-direct"
-  vm()      { "$@"; }
-  vm_sudo() { sudo "$@"; }
+  vm()      { bash -lc "$*"; }
+  vm_sudo() { sudo bash -lc "$*"; }
 else
   HOST_TAG="host-via-orb"
   ORB_VM="${ORB_VM:-fuzzer}"
@@ -99,8 +99,23 @@ fi
 targets=()
 # shellcheck disable=SC2016  # $HOME must expand on the remote host, not locally
 while IFS= read -r t; do
-  [[ -n "$t" ]] && targets+=("$t")
+  [[ -n "$t" ]] || continue
+  if [[ "$t" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    targets+=("$t")
+  fi
 done < <(vm 'ls -1 "$HOME/fuzzing/targets" 2>/dev/null' | tr -d '\r')
+
+target_engine() {
+  local t="$1"
+  vm "tdir=\"\$HOME/fuzzing/targets/$t\"; if [[ -r \"\$tdir/engine\" ]]; then tr -d '[:space:]' < \"\$tdir/engine\" | head -c 64; else echo afl; fi" 2>/dev/null \
+    | tr -d '\r' | awk 'NF {print; exit}'
+}
+
+target_start_state() {
+  local t="$1"
+  vm "sf=\"\$HOME/fuzzing/targets/$t/scripts/start-fuzz.sh\"; if [[ -x \"\$sf\" ]]; then echo executable; elif [[ -f \"\$sf\" ]]; then echo non-executable; else echo missing; fi" 2>/dev/null \
+    | tr -d '\r' | awk 'NF {print; exit}'
+}
 
 # ── systemd unit state (derived from target names) ──────────────────────────
 
@@ -111,8 +126,10 @@ for t in "${targets[@]}"; do
   enabled="$(vm "systemctl --user is-enabled \"$unit\"" 2>/dev/null)"
   since="$(vm "systemctl --user show \"$unit\" -p ActiveEnterTimestamp --value" 2>/dev/null)"
   printf "  %-26s  active=%-8s  enabled=%-9s  since=%s\n" "$unit" "${active:-?}" "${enabled:-?}" "${since:-?}"
-  if [[ "$active" != "active" ]]; then
-    echo "  [!] $unit is not active"
+  if [[ "$active" == "failed" ]]; then
+    echo "  [!] $unit is failed"
+  elif [[ "$active" != "active" ]]; then
+    echo "      info: target services may be oneshot; worker checks below decide runtime health"
   fi
 done
 
@@ -130,21 +147,49 @@ wd_next="$(vm 'systemctl --user list-timers fuzz-watchdog.timer --no-pager' 2>/d
 
 echo "Workers:"
 for t in "${targets[@]}"; do
-  pids="$(vm "pgrep -f \"[a]fl-fuzz.*targets/$t\"" 2>/dev/null)"
-  n="$(echo "$pids" | grep -c '^[0-9]')"
-  printf "  %-12s %d/3 alive" "$t" "$n"
-  if [[ "$n" -lt 3 ]]; then
+  engine="$(target_engine "$t")"
+  engine="${engine:-afl}"
+  start_state="$(target_start_state "$t")"
+  expected=3
+  if [[ "$engine" == "fuzzilli" ]]; then
+    expected=1
+    workers="$(vm "stats=\"\$HOME/fuzzing/targets/$t/findings/stats.json\"; python3 - \"\$stats\" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+try:
+    data = json.load(open(path))
+except Exception:
+    data = {}
+if data.get('alive'):
+    pid = str(data.get('pid') or '?')
+    eps = data.get('execs_per_sec')
+    print(f\"fuzzilli\\t{pid}\\t?\\texecs/s={eps if eps is not None else 0}\")
+PY" 2>/dev/null)"
+  else
+    workers="$(vm "tdir=\"\$HOME/fuzzing/targets/$t\"; find \"\$tdir/findings\" -maxdepth 2 -name fuzzer_stats -print0 2>/dev/null | while IFS= read -r -d '' stats; do
+  pid=\$(awk '/^fuzzer_pid/ {print \$3; exit}' \"\$stats\" 2>/dev/null)
+  [[ -n \"\$pid\" ]] && kill -0 \"\$pid\" 2>/dev/null || continue
+  role=\$(basename \"\$(dirname \"\$stats\")\")
+  args=\$(ps -o args= -p \"\$pid\" 2>/dev/null)
+  m=\$(printf '%s\n' \"\$args\" | grep -oE -- '-m [^ ]+' | head -1)
+  etime=\$(ps -o etime= -p \"\$pid\" 2>/dev/null | tr -d ' ')
+  printf '%s\t%s\t%s\t%s\n' \"\$role\" \"\$pid\" \"\${etime:-?}\" \"\${m:-?}\"
+done" 2>/dev/null)"
+  fi
+  workers="$(printf '%s\n' "$workers" | awk 'NF')"
+  n="$(printf '%s\n' "$workers" | awk 'NF {n++} END {print n+0}')"
+  printf "  %-12s %d/%d alive  engine=%s start=%s" "$t" "$n" "$expected" "$engine" "${start_state:-?}"
+  if [[ "${start_state:-}" == "non-executable" ]]; then
+    printf "   [!] watchdog will skip start-fuzz.sh"
+  elif [[ "$n" -lt "$expected" ]]; then
     printf "   [!] below expected"
   fi
   echo
-  if [[ "$n" -gt 0 ]]; then
-    for p in $pids; do
-      args="$(vm "ps -o args= -p \"$p\"" 2>/dev/null)"
-      role="$(echo "$args" | grep -oE -- '-[MS] [a-z]+' | awk '{print $2}')"
-      m="$(echo "$args"   | grep -oE -- '-m [^ ]+' | head -1)"
-      etime="$(vm "ps -o etime= -p \"$p\"" 2>/dev/null | tr -d ' ')"
-      printf "    %-10s pid=%-8s etime=%-12s %s\n" "${role:-?}" "$p" "${etime:-?}" "${m:-?}"
-    done
+  if [[ "$n" -gt 0 && -n "$workers" ]]; then
+    while IFS=$'\t' read -r role pid etime extra; do
+      [[ -n "${role:-}" ]] || continue
+      printf "    %-10s pid=%-8s etime=%-12s %s\n" "${role:-?}" "${pid:-?}" "${etime:-?}" "${extra:-?}"
+    done <<< "$workers"
   fi
 done
 
